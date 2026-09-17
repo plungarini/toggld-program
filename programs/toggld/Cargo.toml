@@ -1,0 +1,85 @@
+[package]
+name = "toggld"
+version = "0.0.0"
+description = "Created with Anchor"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "toggld"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+# Builds the disposable devnet-scratch deployment (see `lib.rs`'s
+# `declare_id!` doc comment) under a SEPARATE program address from the
+# devnet-mirrors-mainnet one. Never combine with a mainnet deploy —
+# `anchor build --  --features devnet-scratch` (or `cargo build-sbf --
+# --features devnet-scratch`) only, and only when deploying to
+# `SVXHvuGg1FxHFGw2hTHwMpz4dCCUVqoDv53wJN2uybS`.
+devnet-scratch = []
+
+
+[dependencies]
+# `init-if-needed`: used by the per-bidder `PendingRefund` PDA in
+# `claim_refund`/`challenge` (challenge.rs), which must be lazily created the
+# first time a given bidder is ever outbid and simply accumulated into on
+# every subsequent outbid before they claim. The seed driving that PDA
+# (`global_state.top_bidder`) is read from on-chain state, never supplied
+# directly by the transaction's accounts list, so the documented
+# re-initialization footgun (an attacker supplying an account whose init
+# path can be re-triggered to clobber legitimate data) does not apply here:
+# there is no way for a caller to make this account represent anyone other
+# than the real previous top bidder, and re-running the init branch is a
+# no-op once the account already carries the correct discriminator/owner.
+anchor-lang = { version = "1.1.2", features = ["init-if-needed"] }
+
+# Phase 8 ($TOGGLD token launch): SPL mint / ATA / burn CPIs used by
+# `setup_token`, `init_team_vesting`, `claim_vested`, and `burn_tokens`.
+# Pinned to the exact `anchor-lang` version — Anchor keeps the two crates
+# version-locked and a mismatch is a known trait-incompatibility source.
+# Classic `anchor_spl::token` (not `token_interface`/Token-2022): our mint is
+# a plain SPL token for maximum DEX/wallet/indexer compatibility (PHASE_8_PLAN §3).
+anchor-spl = { version = "1.1.2", features = ["token", "associated_token"] }
+
+# Phase R3 (Win NFT): Metaplex Core CPI target for `mint_win_nft`. A Core
+# `CreateV1` CPI creates one asset account that IS the mint, metadata, and
+# ownership record -- no separate SPL mint/ATA/Master Edition, no
+# `update_authority` to remember to revoke (passed `None` at creation for a
+# permanently-immutable asset). Strictly less on-chain surface than the
+# legacy Token Metadata path for a 1-of-1 commemorative NFT. See
+# PHASE_R3_PLAN.md §2.3.
+mpl-core = "0.12.1"
+
+# Phase R3 redesign (Win NFT tamper-proofing, Mechanism 2): instruction
+# introspection for the Ed25519 metadata-signer attestation in
+# `mint_win_nft`. `anchor_lang::solana_program::sysvar::instructions` (this
+# anchor-lang version) only re-exports `BorrowedAccountMeta`/
+# `BorrowedInstruction`/`construct_instructions_data`, not the
+# `load_current_index_checked`/`load_instruction_at_checked` helpers or the
+# sysvar's own `ID` -- both already sit in the dependency tree transitively
+# (anchor-lang -> solana-instructions-sysvar / solana-sdk-ids), pinned here to
+# the exact versions already resolved in Cargo.lock so this adds no new
+# version to the graph.
+solana-instructions-sysvar = "3.0.1"
+solana-sdk-ids = "3.1.0"
+
+# Phase R7: embeds a static security.txt section in the deployed ELF so
+# block explorers / security researchers can discover contact/policy info
+# without out-of-band communication. See `lib.rs`'s `security_txt!` call.
+solana-security-txt = "1.1.3"
+# `env!` with no fallback hard-fails the build if unset at compile time; this
+# crate's own README recommends pairing it with `default_env!` (the `env!`
+# macro but with a default value) for exactly this use case, so `source_revision`
+# below can compile even when `TOGGLD_GIT_SHA` isn't set in the environment.
+default-env = "0.1.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
