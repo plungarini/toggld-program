@@ -22,7 +22,7 @@ pub use state::*;
 // devnet-mirrors-mainnet address above. Never build mainnet with this
 // feature enabled — see Cargo.toml's `devnet-scratch` feature doc comment.
 #[cfg(not(feature = "devnet-scratch"))]
-declare_id!("TGLDktEJpotXY4AD7DN87huoX7raCxHhnBqetELb5MC");
+declare_id!("TGLDv9L2xHKHRi2yQJSKt5QCKpH6fZrAz4kJ4wydPhR");
 #[cfg(feature = "devnet-scratch")]
 declare_id!("3VD3z82gxHoHneFdT3oVpYTfbzqfhYjhqREzTp1FyWhy");
 
