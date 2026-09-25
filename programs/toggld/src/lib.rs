@@ -32,25 +32,27 @@ declare_id!("3VD3z82gxHoHneFdT3oVpYTfbzqfhYjhqREzTp1FyWhy");
 // copies of its `#[no_mangle] security_txt` static collide at link time
 // ("multiple definition of security_txt").
 //
-// `source_revision` uses `default_env!` (the `env!` macro but with a
-// fallback), the exact pattern this crate's own README recommends for this
-// field, because plain `env!` has no default form and would hard-fail any
-// build where the var isn't set. `TOGGLD_GIT_SHA` is NOT set by a plain
-// `anchor build`/`cargo build-sbf` -- a real deploy's build wrapper MUST set
-// it (e.g. `TOGGLD_GIT_SHA=$(git rev-parse HEAD) anchor build`) for this
-// field to reflect the actually-deployed commit. Confirmed during Phase R7's
-// local-validator pass that a freshly built binary's embedded revision
-// matches `git rev-parse HEAD` before this is relied on for real. Without
-// that env var, this falls back to the literal below, which must never be
-// mistaken for a real revision.
+// `source_revision` is a plain string literal, kept in lockstep with
+// `declare_id!`'s own sync-then-commit convention -- NOT an env var. An
+// earlier version used `default_env!("TOGGLD_GIT_SHA", ...)`, set via
+// `export TOGGLD_GIT_SHA=$(git rev-parse HEAD)` right before
+// `solana-verify build`; confirmed broken 2026-09-25 (Solscan's Security tab
+// showed the literal fallback string on the live R9.1 deploy): solana-verify
+// build's Docker container never forwards host environment variables into
+// the build, so that env var silently never reached cargo, on this deploy or
+// the original R7 one. A commit cannot embed its own hash (the hash is a
+// function of the commit's own content), so this literal is the immediate
+// PARENT commit's hash -- the one right before this file's own last edit,
+// whose actual program logic (everything except this literal) is identical
+// to what's built and deployed here.
 #[cfg(not(feature = "no-entrypoint"))]
 solana_security_txt::security_txt! {
     name: "TOGGLD",
     project_url: "https://toggld.win",
-    contacts: "email:pietro@lungarini.it",
+    contacts: "email:pietro@toggld.win",
     policy: "https://toggld.win/legal/risk-disclosure",
     source_code: "https://github.com/plungarini/toggld-program",
-    source_revision: default_env::default_env!("TOGGLD_GIT_SHA", "unset-set-TOGGLD_GIT_SHA-at-build-time")
+    source_revision: "99e440589c97509a9ec80323b4f8d28f4bd2600e"
 }
 
 #[program]

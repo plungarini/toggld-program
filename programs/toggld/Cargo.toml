@@ -84,11 +84,6 @@ solana-sdk-ids = "3.1.0"
 # block explorers / security researchers can discover contact/policy info
 # without out-of-band communication. See `lib.rs`'s `security_txt!` call.
 solana-security-txt = "1.1.3"
-# `env!` with no fallback hard-fails the build if unset at compile time; this
-# crate's own README recommends pairing it with `default_env!` (the `env!`
-# macro but with a default value) for exactly this use case, so `source_revision`
-# below can compile even when `TOGGLD_GIT_SHA` isn't set in the environment.
-default-env = "0.1.1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
