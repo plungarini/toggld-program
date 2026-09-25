@@ -1,9 +1,0 @@
-/build/target/sbpf-solana-solana/release/deps/spl_associated_token_account_interface-638bc0ff0eefe0c5.d: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/lib.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/address.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/instruction.rs
-
-/build/target/sbpf-solana-solana/release/deps/libspl_associated_token_account_interface-638bc0ff0eefe0c5.rlib: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/lib.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/address.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/instruction.rs
-
-/build/target/sbpf-solana-solana/release/deps/libspl_associated_token_account_interface-638bc0ff0eefe0c5.rmeta: /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/lib.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/address.rs /usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/instruction.rs
-
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/lib.rs:
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/address.rs:
-/usr/local/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spl-associated-token-account-interface-2.0.0/src/instruction.rs:
