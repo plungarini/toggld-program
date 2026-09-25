@@ -1,0 +1,2 @@
+Error: Function _ZN8mpl_core6hooked6plugin31registry_records_to_plugin_list17h3bd95974de9f8d0aE Stack offset of 4224 exceeded max offset of 4096 by 128 bytes, please minimize large stack variables. Estimated function frame size: 4544 bytes. Exceeding the maximum stack offset may cause undefined behavior during execution.
+
