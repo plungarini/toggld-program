@@ -4,7 +4,7 @@ use anchor_lang::system_program::{self, System, Transfer};
 use crate::constants::*;
 use crate::error::ErrorCode;
 use crate::instructions::events::ChallengeEvent;
-use crate::pure::{compute_window_extension, require_min_raise};
+use crate::pure::{compute_window_reset, require_min_raise};
 use crate::state::{GlobalState, PendingRefund};
 
 #[derive(Accounts)]
@@ -77,9 +77,7 @@ pub(crate) fn handler(ctx: Context<Challenge>, bid_amount: u64) -> Result<()> {
             require_min_raise(global_state.current_price, bid_amount, global_state.min_raise_bps)?;
 
             global_state.window_active = true;
-            global_state.window_end_ts = now
-                .checked_add(global_state.base_window_secs as i64)
-                .ok_or(ErrorCode::MathOverflow)?;
+            global_state.window_end_ts = compute_window_reset(global_state.base_window_secs, now)?;
         } else {
             require!(now < global_state.window_end_ts, ErrorCode::WindowClosedPendingSettlement);
 
@@ -91,16 +89,11 @@ pub(crate) fn handler(ctx: Context<Challenge>, bid_amount: u64) -> Result<()> {
 
             require_min_raise(global_state.top_bid_amount, bid_amount, global_state.min_raise_bps)?;
 
-            // Extends from the current end (not from `now`), so repeated
-            // late bids keep pushing the window out rather than resetting
-            // to a fixed offset — sustained sniping stays expensive.
-            let (new_window_end_ts, did_extend) = compute_window_extension(
-                global_state.window_end_ts,
-                global_state.snipe_extend_secs,
-                now,
-            )?;
-            global_state.window_end_ts = new_window_end_ts;
-            extended = did_extend;
+            // Every bid gets a fresh full window to be answered in; `max` makes
+            // "the deadline never moves backward" structural, not just arithmetic.
+            global_state.window_end_ts = compute_window_reset(global_state.base_window_secs, now)?
+                .max(global_state.window_end_ts);
+            extended = true;
         }
     }
 
@@ -134,6 +127,11 @@ pub(crate) fn handler(ctx: Context<Challenge>, bid_amount: u64) -> Result<()> {
         if pending_refund.bidder == Pubkey::default() {
             pending_refund.bidder = previous_top_bidder;
             pending_refund.bump = pending_refund_bump;
+            // Recorded once, at creation, so `claim_refund()` knows who to
+            // return this account's rent-exempt reserve to -- `challenger`
+            // (this call's signer), never `previous_top_bidder` (see
+            // `PendingRefund::rent_payer`'s own doc comment).
+            pending_refund.rent_payer = challenger_key;
         } else {
             // Already-initialized account: its bidder must be exactly the
             // pubkey the PDA was derived from (guaranteed by the seeds

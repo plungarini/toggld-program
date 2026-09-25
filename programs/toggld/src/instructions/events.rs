@@ -6,8 +6,8 @@ pub struct ChallengeEvent {
     pub challenger: Pubkey,
     pub bid_amount: u64,
     pub window_end_ts: i64,
-    /// True when this bid landed inside the anti-snipe threshold and pushed
-    /// `window_end_ts` out by `snipe_extend_secs`.
+    /// True when this bid reset an already-active window to `now + base_window_secs`;
+    /// false for a cold open, which starts a fresh window instead.
     pub extended: bool,
 }
 
@@ -117,4 +117,13 @@ pub struct WinNftMintedEvent {
     pub won_at: i64,
     pub minted_at: i64,
     pub uri: String,
+}
+
+/// Emitted by the one-time `init_nft_collection()` call, so the collection's
+/// address and its royalty/creator terms are publicly verifiable from day one.
+#[event]
+pub struct NftCollectionInitializedEvent {
+    pub collection: Pubkey,
+    pub treasury: Pubkey,
+    pub royalty_basis_points: u16,
 }

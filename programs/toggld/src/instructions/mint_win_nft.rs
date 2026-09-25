@@ -1,12 +1,12 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::System;
-use mpl_core::instructions::{CreateV1CpiBuilder, UpdateV1CpiBuilder};
-use mpl_core::types::{Attribute, Attributes, Plugin, PluginAuthority, PluginAuthorityPair, UpdateAuthority};
+use mpl_core::instructions::CreateV1CpiBuilder;
+use mpl_core::types::{Attribute, Attributes, ImmutableMetadata, Plugin, PluginAuthority, PluginAuthorityPair};
 
-use crate::constants::{MAX_NFT_URI_LEN, METADATA_SIGNER};
+use crate::constants::{COLLECTION_AUTHORITY_SEED, MAX_NFT_URI_LEN, METADATA_SIGNER, NFT_COLLECTION_CONFIG_SEED};
 use crate::error::ErrorCode;
 use crate::instructions::events::WinNftMintedEvent;
-use crate::state::WinRecord;
+use crate::state::{NftCollectionConfig, WinRecord};
 
 #[derive(Accounts)]
 pub struct MintWinNft<'info> {
@@ -32,6 +32,30 @@ pub struct MintWinNft<'info> {
     /// program, not this program).
     #[account(mut)]
     pub asset: Signer<'info>,
+
+    /// The shared Win NFT collection -- constrained against the one-time
+    /// `init_nft_collection()` record so a caller can never substitute a
+    /// different collection here.
+    #[account(
+        seeds = [NFT_COLLECTION_CONFIG_SEED],
+        bump = nft_collection_config.bump,
+    )]
+    pub nft_collection_config: Account<'info, NftCollectionConfig>,
+
+    /// CHECK: the mpl-core Collection account itself, address-constrained
+    /// against `nft_collection_config.collection`.
+    #[account(mut, address = nft_collection_config.collection @ ErrorCode::InvalidNftCollection)]
+    pub collection: UncheckedAccount<'info>,
+
+    /// CHECK: pure-signing PDA, an `UpdateDelegate` additional delegate on
+    /// the collection (not its literal `update_authority`, which is `admin`
+    /// -- a real wallet, so marketplace ownership-verification flows can be
+    /// signed for real; see `init_nft_collection.rs`). `invoke_signed` below
+    /// authorizes linking this asset into the collection on the collection's
+    /// behalf -- required because `caller` (an arbitrary winner) is never
+    /// admin.
+    #[account(seeds = [COLLECTION_AUTHORITY_SEED], bump = nft_collection_config.collection_authority_bump)]
+    pub collection_authority: UncheckedAccount<'info>,
 
     /// CHECK: validated by address against the well-known mpl-core program id.
     #[account(address = mpl_core::ID)]
@@ -175,28 +199,30 @@ pub(crate) fn handler(ctx: Context<MintWinNft>, uri: String, content_hash: [u8; 
     );
     verify_metadata_signature(&ctx.accounts.instructions_sysvar, &content_hash)?;
 
-    // Snapshot-once, immutable. NOTE, a deviation from PHASE_R3_PLAN.md
-    // §2.3's assumption (caught by the LiteSVM happy-path test below):
-    // passing `update_authority(None)` to `CreateV1` does NOT itself produce
-    // an immutable `UpdateAuthority::None` asset -- mpl-core's on-chain
-    // behavior when that optional account is omitted is to default the new
-    // asset's update authority to `Address(authority)` (here, `caller`),
-    // same as `owner` defaults to `authority` when omitted. Genuine
-    // immutability needs an explicit second call: `UpdateV1` with
-    // `new_update_authority: Some(UpdateAuthority::None)`, which -- unlike
-    // omitting the field -- is a real instruction to null out the update
-    // authority. Both CPIs run inside this one atomic instruction, so there
-    // is never an externally-observable window where the asset exists with
-    // a live, usable update authority.
+    // Snapshot-once, immutable -- but via two targeted, mpl-core-enforced
+    // plugin-level locks instead of nulling the whole asset's
+    // `update_authority`, because this asset is a Collection member (its
+    // `update_authority` is `Collection(collection_authority)`, mutually
+    // exclusive with `None` -- collection membership IS the update-authority
+    // mechanism in mpl-core, not a separate field). The two locks:
+    //  1. The `Attributes` plugin's OWN authority is `PluginAuthority::None`,
+    //     not `UpdateAuthority` -- so the actual win data below is frozen
+    //     regardless of who controls the collection's authority.
+    //  2. `ImmutableMetadata` freezes `name`/`uri` too ("cannot be removed
+    //     after addition", per mpl-core's docs) -- so which JSON metadata
+    //     file this asset points to, and its display name, are equally
+    //     permanent. Together these cover every field that actually carries
+    //     meaning; only entirely-new future plugins could theoretically be
+    //     added by the collection authority, which -- like every other
+    //     capability in this program -- depends on this program's own code
+    //     never doing that, the same trust boundary every instruction here
+    //     already has until upgrade authority is eventually revoked.
     let name = format!("TOGGLD Win #{}", win_record.holder_count);
 
     // Mechanism 1 (§2.1): the NFT's ground-truth facts, sourced directly
     // from the already-deserialized, program-verified `win_record` -- never
     // from client-supplied values -- so a client can never forge the
-    // winner/holder#/price/timestamp a viewer sees on-chain. Authority is
-    // `UpdateAuthority`, never `Owner`: a holder must never be able to edit
-    // their own stats post-mint, and the update authority is nulled out
-    // below in the same atomic instruction anyway.
+    // winner/holder#/price/timestamp a viewer sees on-chain.
     let metadata_hash_hex = to_hex(&content_hash);
     let attributes_plugin = PluginAuthorityPair {
         plugin: Plugin::Attributes(Attributes {
@@ -208,30 +234,30 @@ pub(crate) fn handler(ctx: Context<MintWinNft>, uri: String, content_hash: [u8; 
                 Attribute { key: "metadata_hash".into(), value: metadata_hash_hex },
             ],
         }),
+        authority: Some(PluginAuthority::None),
+    };
+    let immutable_metadata_plugin = PluginAuthorityPair {
+        plugin: Plugin::ImmutableMetadata(ImmutableMetadata {}),
         authority: Some(PluginAuthority::UpdateAuthority),
     };
 
+    let collection_authority_bump = ctx.accounts.nft_collection_config.collection_authority_bump;
+    let collection_authority_seeds: &[&[u8]] =
+        &[COLLECTION_AUTHORITY_SEED, &[collection_authority_bump]];
+    let signer_seeds: &[&[&[u8]]] = &[collection_authority_seeds];
+
     CreateV1CpiBuilder::new(&ctx.accounts.mpl_core_program.to_account_info())
         .asset(&ctx.accounts.asset.to_account_info())
-        .collection(None)
-        .authority(Some(&ctx.accounts.caller.to_account_info()))
+        .collection(Some(&ctx.accounts.collection.to_account_info()))
+        .authority(Some(&ctx.accounts.collection_authority.to_account_info()))
         .payer(&ctx.accounts.caller.to_account_info())
         .owner(Some(&ctx.accounts.caller.to_account_info()))
         .update_authority(None)
         .system_program(&ctx.accounts.system_program.to_account_info())
         .name(name)
         .uri(uri.clone())
-        .plugins(vec![attributes_plugin])
-        .invoke()?;
-
-    UpdateV1CpiBuilder::new(&ctx.accounts.mpl_core_program.to_account_info())
-        .asset(&ctx.accounts.asset.to_account_info())
-        .collection(None)
-        .payer(&ctx.accounts.caller.to_account_info())
-        .authority(Some(&ctx.accounts.caller.to_account_info()))
-        .system_program(&ctx.accounts.system_program.to_account_info())
-        .new_update_authority(UpdateAuthority::None)
-        .invoke()?;
+        .plugins(vec![attributes_plugin, immutable_metadata_plugin])
+        .invoke_signed(signer_seeds)?;
 
     win_record.minted = true;
 

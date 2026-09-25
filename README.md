@@ -35,9 +35,11 @@ solana-verify get-program-hash -u mainnet-beta <PROGRAM_ADDRESS>
 ## Testing
 
 Integration tests run against [LiteSVM](https://github.com/LiteSVM/litesvm), no local validator
-required:
+required. They load a separate `test-fixtures` build (a test-only metadata-signer key, never
+deployed), so build that first:
 
 ```
+cargo build-sbf --manifest-path programs/toggld/Cargo.toml --features test-fixtures --sbf-out-dir target/deploy-test-fixtures
 cargo test
 ```
 

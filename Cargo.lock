@@ -4627,6 +4627,7 @@ name = "toggld-workspace"
 version = "0.0.0"
 dependencies = [
  "anchor-lang",
+ "base64 0.22.1",
  "bincode",
  "ed25519-dalek 2.2.0",
  "litesvm",

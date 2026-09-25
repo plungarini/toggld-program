@@ -27,34 +27,13 @@ pub fn require_min_raise(base: u64, bid: u64, min_raise_bps: u16) -> Result<()> 
     Ok(())
 }
 
-/// Anti-snipe window-extension calculation. Given the current window end
-/// timestamp, the configured snipe-extend duration, and the timestamp `now`
-/// a bid landed at, returns `(new_window_end_ts, extended)`.
-///
-/// The window is extended (by exactly `snipe_extend_secs`, added to the
-/// *current* end — never reset to a fixed offset from `now`) iff `now` falls
-/// within `snipe_extend_secs` of the current close. Otherwise the end is
-/// returned unchanged.
-///
-/// Extracted from the inline snipe-threshold block in
-/// `instructions::challenge::handler`.
-pub fn compute_window_extension(
-    window_end_ts: i64,
-    snipe_extend_secs: u32,
-    now: i64,
-) -> Result<(i64, bool)> {
-    let snipe_threshold = window_end_ts
-        .checked_sub(snipe_extend_secs as i64)
-        .ok_or(ErrorCode::MathOverflow)?;
-
-    if now >= snipe_threshold {
-        let new_end = window_end_ts
-            .checked_add(snipe_extend_secs as i64)
-            .ok_or(ErrorCode::MathOverflow)?;
-        Ok((new_end, true))
-    } else {
-        Ok((window_end_ts, false))
-    }
+/// Window deadline after a bid landing at `now`: always a fresh full
+/// `base_window_secs` from `now`, for a cold open and a mid-window bid alike.
+/// No late-bid threshold, no additive extension: a window stays open exactly
+/// as long as someone keeps answering the last bid within `base_window_secs`.
+pub fn compute_window_reset(base_window_secs: u32, now: i64) -> Result<i64> {
+    now.checked_add(base_window_secs as i64)
+        .ok_or_else(|| error!(ErrorCode::MathOverflow))
 }
 
 /// 15%/85%-style treasury/burn split of a winning bid, computed in `u128` to
@@ -129,17 +108,26 @@ mod tests {
     }
 
     #[test]
-    fn window_extension_extends_on_late_bid() {
-        let (new_end, extended) = compute_window_extension(1000, 10, 995).unwrap();
-        assert!(extended);
-        assert_eq!(new_end, 1010);
+    fn window_reset_is_now_plus_base_regardless_of_timing() {
+        assert_eq!(compute_window_reset(30, 995).unwrap(), 1025);
+        assert_eq!(compute_window_reset(30, 500).unwrap(), 530);
+        assert_eq!(compute_window_reset(0, 500).unwrap(), 500);
     }
 
     #[test]
-    fn window_extension_unchanged_on_early_bid() {
-        let (new_end, extended) = compute_window_extension(1000, 10, 500).unwrap();
-        assert!(!extended);
-        assert_eq!(new_end, 1000);
+    fn window_reset_successive_bids_never_accumulate() {
+        assert_eq!(compute_window_reset(30, 1000).unwrap(), 1030);
+        assert_eq!(compute_window_reset(30, 1005).unwrap(), 1035);
+    }
+
+    #[test]
+    fn window_reset_overflow_is_rejected() {
+        assert!(compute_window_reset(30, i64::MAX).is_err());
+        assert!(compute_window_reset(u32::MAX, i64::MAX - i64::from(u32::MAX) + 1).is_err());
+        assert_eq!(
+            compute_window_reset(u32::MAX, i64::MAX - i64::from(u32::MAX)).unwrap(),
+            i64::MAX
+        );
     }
 
     #[test]

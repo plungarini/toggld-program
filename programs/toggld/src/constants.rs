@@ -14,7 +14,6 @@ pub const INCINERATOR: Pubkey = pubkey!("1nc1nerator1111111111111111111111111111
 /// immutable from the first instant).
 pub const DEFAULT_MIN_RAISE_BPS: u16 = 500;
 pub const DEFAULT_BASE_WINDOW_SECS: u32 = 30;
-pub const DEFAULT_SNIPE_EXTEND_SECS: u32 = 10;
 
 /// PDA seeds, shared across every instruction that needs to derive or verify
 /// the `GlobalState` / `Vault` addresses.
@@ -50,18 +49,40 @@ pub const MAX_NFT_URI_LEN: usize = 200;
 /// since the admin already holds upgrade authority (not yet locked, per root
 /// CLAUDE.md) and this key can never move funds either way.
 ///
-/// This is the real local-dev keypair's public half -- its secret lives in
-/// `apps/web/.env.local` (gitignored) as `NFT_METADATA_SIGNER_SECRET`,
-/// generated fresh 2026-09-15 via `lib/nft/metadata-signer.ts`'s
-/// `@noble/curves/ed25519` signing path (see that file's module doc). It
-/// matches `tests/toggld.rs`'s `METADATA_SIGNER_SEED` fixture, so LiteSVM
-/// tests exercise a genuine Ed25519Program attestation end-to-end -- but it
-/// is still only a local-dev/test key. A genuinely different keypair MUST be
-/// minted for a real mainnet/production deploy (same posture as every other
-/// dev-vs-prod secret in this repo -- see root CLAUDE.md's "Local dev
-/// environment" section), and this constant updated to match before that
-/// deploy.
+/// Default build (every real/verified build): the dedicated PRODUCTION
+/// signer, committed as-is so `solana-verify verify-from-repo` reproduces the
+/// deployed binary; its secret lives only in apps/web's Secret Manager
+/// `NFT_METADATA_SIGNER_SECRET`.
+///
+/// `test-fixtures` Cargo feature (LiteSVM tests only, see Cargo.toml): the
+/// local-dev key derived from `tests/toggld.rs`'s `METADATA_SIGNER_SEED`, so
+/// tests exercise a genuine Ed25519Program attestation end-to-end.
+/// `scripts/deploy-mainnet.sh` refuses any binary embedding this fixture key.
+#[cfg(not(feature = "test-fixtures"))]
+pub const METADATA_SIGNER: Pubkey = pubkey!("BprArV2odeb24pizwVyYK4K8hGfjmHZxpsGUdykU2HZK");
+#[cfg(feature = "test-fixtures")]
 pub const METADATA_SIGNER: Pubkey = pubkey!("CmgGk8qipHS9bVSyD5e7PRyApBAh9k8cg4oGkyfk6xRB");
+
+/// Seed for the one-time `NftCollectionConfig` PDA created by
+/// `init_nft_collection()`.
+pub const NFT_COLLECTION_CONFIG_SEED: &[u8] = b"nft_collection_config";
+
+/// Seed for the pure-signing PDA that acts as the mpl-core Collection's
+/// `update_authority`. Never holds data beyond its own rent reserve -- it
+/// exists only so `mint_win_nft()` can `invoke_signed` on the collection's
+/// behalf to link each new win into it, since every mint is signed by an
+/// arbitrary winner, never by admin.
+pub const COLLECTION_AUTHORITY_SEED: &[u8] = b"collection_authority";
+
+/// Secondary-sale royalty on the Win NFT collection, in basis points (500 =
+/// 5%), paid entirely to `global_state.treasury`. Set once at
+/// `init_nft_collection()` time via the `Royalties` plugin.
+pub const NFT_ROYALTY_BASIS_POINTS: u16 = 500;
+
+/// Sanity ceilings on `init_nft_collection`'s `name`/`uri` args, same
+/// bounded-not-strict spirit as `MAX_NFT_URI_LEN`.
+pub const MAX_COLLECTION_NAME_LEN: usize = 32;
+pub const MAX_COLLECTION_URI_LEN: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Phase 8 — $TOGGLD token launch

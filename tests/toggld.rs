@@ -1,9 +1,16 @@
 //! Phase 1 LiteSVM integration tests for the TOGGLD core challenge/defend contract.
 //!
 //! Every test drives the real compiled `.so` (LiteSVM, in-process, no devnet dependency).
-//! Time-based logic (window expiry, anti-snipe boundary) is exercised by directly
+//! Time-based logic (window expiry, per-bid window reset) is exercised by directly
 //! overwriting the `Clock` sysvar via `LiteSVM::set_sysvar`, giving each test full,
 //! deterministic control over `now` rather than relying on wall-clock elapsed time.
+//!
+//! The `.so` loaded here is the `test-fixtures` build (fixture `METADATA_SIGNER`, see
+//! programs/toggld/Cargo.toml), kept in its own out dir so it never shadows the deployable
+//! target/deploy/toggld.so. Run (WSL):
+//!
+//!   cargo build-sbf --manifest-path programs/toggld/Cargo.toml --features test-fixtures --sbf-out-dir target/deploy-test-fixtures
+//!   cargo test
 
 use {
     anchor_lang::{
@@ -12,8 +19,9 @@ use {
             bpf_loader_upgradeable, bpf_loader_upgradeable::UpgradeableLoaderState,
             instruction::Instruction,
         },
-        AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas,
+        AccountDeserialize, AnchorDeserialize, AnchorSerialize, Discriminator, InstructionData, ToAccountMetas,
     },
+    base64::{engine::general_purpose::STANDARD as BASE64, Engine as _},
     ed25519_dalek::{Signer as DalekSigner, SigningKey},
     litesvm::LiteSVM,
     solana_account::Account as SvmAccount,
@@ -25,13 +33,14 @@ use {
     litesvm::types::TransactionResult,
     toggld::{
         constants::{
-            BURN_VAULT_SEED, DEFAULT_BASE_WINDOW_SECS, DEFAULT_MIN_RAISE_BPS, FEE_BPS, GLOBAL_STATE_SEED, INCINERATOR,
+            BURN_VAULT_SEED, COLLECTION_AUTHORITY_SEED, DEFAULT_MIN_RAISE_BPS, FEE_BPS, GLOBAL_STATE_SEED, INCINERATOR,
             MAX_NFT_URI_LEN, MAX_SLIPPAGE_BPS_CEILING,
-            METADATA_SIGNER, MIN_SWEEP_LAMPORTS, REFUND_SEED, TEAM_VESTING_SEED, TOKEN_CONFIG_SEED,
+            METADATA_SIGNER, MIN_SWEEP_LAMPORTS, NFT_COLLECTION_CONFIG_SEED, NFT_ROYALTY_BASIS_POINTS, REFUND_SEED, TEAM_VESTING_SEED, TOKEN_CONFIG_SEED,
             TOTAL_TOKEN_SUPPLY, VAULT_SEED, WIN_RECORD_SEED, WSOL_MINT,
         },
         dbc_cpi::DBC_PROGRAM_ID,
-        state::{GlobalState, PendingRefund, TeamVesting, TokenConfig, WinRecord},
+        instructions::events::ChallengeEvent,
+        state::{GlobalState, NftCollectionConfig, PendingRefund, TeamVesting, TokenConfig, WinRecord},
     },
 };
 
@@ -88,7 +97,7 @@ fn set_upgrade_authority(svm: &mut LiteSVM, program_id: Pubkey, authority: Pubke
 fn new_svm() -> (LiteSVM, Pubkey, Pubkey, Keypair) {
     let program_id = toggld::id();
     let mut svm = LiteSVM::new();
-    let bytes = include_bytes!("../target/deploy/toggld.so");
+    let bytes = include_bytes!("../target/deploy-test-fixtures/toggld.so");
     svm.add_program(program_id, bytes).unwrap();
 
     // Real Metaplex Core program bytecode (dumped from devnet -- see
@@ -175,6 +184,21 @@ fn get_global_state(svm: &LiteSVM, global_state: Pubkey) -> GlobalState {
         .expect("global_state account should exist");
     GlobalState::try_deserialize(&mut account.data.as_slice())
         .expect("GlobalState should deserialize")
+}
+
+/// Decodes the single `ChallengeEvent` a successful `challenge()` emits (Anchor `emit!` log line).
+fn challenge_event(res: &TransactionResult) -> ChallengeEvent {
+    let meta = res.as_ref().expect("challenge should succeed");
+    let events: Vec<ChallengeEvent> = meta
+        .logs
+        .iter()
+        .filter_map(|l| l.strip_prefix("Program data: "))
+        .filter_map(|b64| BASE64.decode(b64).ok())
+        .filter(|bytes| bytes.starts_with(ChallengeEvent::DISCRIMINATOR))
+        .map(|bytes| ChallengeEvent::deserialize(&mut &bytes[ChallengeEvent::DISCRIMINATOR.len()..]).unwrap())
+        .collect();
+    assert_eq!(events.len(), 1, "expected exactly one ChallengeEvent, logs: {:#?}", meta.logs);
+    events.into_iter().next().unwrap()
 }
 
 /// Returns `None` when the account doesn't exist yet or fails to
@@ -345,13 +369,23 @@ fn ix_challenge_with_explicit_pending_refund(
     )
 }
 
-fn ix_claim_refund(claimant: Pubkey) -> Instruction {
+/// `rent_payer` must be the *actual* `pending_refund.rent_payer` recorded
+/// on-chain (whoever's `challenge()` call first created this claimant's
+/// `PendingRefund` PDA) — passing anything else fails the account's
+/// `address` constraint. See `ix_claim_refund_with_rent_payer` for the
+/// adversarial "wrong account supplied" case.
+fn ix_claim_refund(claimant: Pubkey, rent_payer: Pubkey) -> Instruction {
+    ix_claim_refund_with_rent_payer(claimant, rent_payer)
+}
+
+fn ix_claim_refund_with_rent_payer(claimant: Pubkey, rent_payer: Pubkey) -> Instruction {
     Instruction::new_with_bytes(
         toggld::id(),
         &toggld::instruction::ClaimRefund {}.data(),
         toggld::accounts::ClaimRefund {
             claimant,
             pending_refund: pending_refund_pda(claimant),
+            rent_payer,
         }
         .to_account_metas(None),
     )
@@ -396,10 +430,62 @@ fn get_win_record(svm: &LiteSVM, pubkey: Pubkey) -> Option<WinRecord> {
     WinRecord::try_deserialize(&mut account.data.as_slice()).ok()
 }
 
+fn nft_collection_config_pda() -> Pubkey {
+    Pubkey::find_program_address(&[NFT_COLLECTION_CONFIG_SEED], &toggld::id()).0
+}
+
+fn collection_authority_pda() -> Pubkey {
+    Pubkey::find_program_address(&[COLLECTION_AUTHORITY_SEED], &toggld::id()).0
+}
+
+fn ix_init_nft_collection(
+    admin: Pubkey,
+    global_state: Pubkey,
+    collection: Pubkey,
+    name: String,
+    uri: String,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        toggld::id(),
+        &toggld::instruction::InitNftCollection { name, uri }.data(),
+        toggld::accounts::InitNftCollection {
+            admin,
+            global_state,
+            nft_collection_config: nft_collection_config_pda(),
+            collection,
+            collection_authority: collection_authority_pda(),
+            mpl_core_program: mpl_core::ID,
+            system_program: system_program_id(),
+        }
+        .to_account_metas(None),
+    )
+}
+
+/// Sends `init_nft_collection()` for the test and returns the new
+/// collection's address -- shared by every `mint_win_nft` test, since a
+/// mint's `collection`/`nft_collection_config`/`collection_authority`
+/// accounts are all validated (and, for `nft_collection_config`,
+/// deserialized) before any handler-body `require!` runs, so they must be
+/// genuinely initialized even for tests targeting an unrelated rejection.
+fn init_nft_collection_for_test(svm: &mut LiteSVM, admin: &Keypair, global_state: Pubkey) -> Pubkey {
+    let collection = Keypair::new();
+    let ix = ix_init_nft_collection(
+        admin.pubkey(),
+        global_state,
+        collection.pubkey(),
+        "TOGGLD".to_string(),
+        "https://arweave.net/toggld-collection".to_string(),
+    );
+    let res = send_with_signers(svm, admin, &[admin, &collection], ix);
+    assert!(res.is_ok(), "init_nft_collection_for_test: {:?}", res.err());
+    collection.pubkey()
+}
+
 fn ix_mint_win_nft(
     caller: Pubkey,
     win_record: Pubkey,
     asset: Pubkey,
+    collection: Pubkey,
     uri: String,
     content_hash: [u8; 32],
 ) -> Instruction {
@@ -410,6 +496,9 @@ fn ix_mint_win_nft(
             caller,
             win_record,
             asset,
+            nft_collection_config: nft_collection_config_pda(),
+            collection,
+            collection_authority: collection_authority_pda(),
             mpl_core_program: mpl_core::ID,
             instructions_sysvar: solana_instructions_sysvar::ID,
             system_program: system_program_id(),
@@ -422,13 +511,13 @@ fn ix_mint_win_nft(
 // Ed25519 metadata-signer attestation (Mechanism 2, WIN_NFT_PAYMENT_SECURITY_PLAN.md §2.2)
 // ---------------------------------------------------------------------------
 
-/// Fixed, dev-only 32-byte ed25519 seed whose public key is exactly
-/// `constants::METADATA_SIGNER` (see that constant's doc comment in
-/// `constants.rs`) -- lets these LiteSVM tests build a genuine,
-/// Ed25519Program-verifiable attestation end-to-end, not a mock. This is the
-/// real local-dev seed decoded from `apps/web/.env.local`'s
-/// `NFT_METADATA_SIGNER_SECRET` (first 32 of its 64 raw bytes), so it stays
-/// in sync with the real `METADATA_SIGNER` constant above.
+/// Fixed, dev-only 32-byte ed25519 seed whose public key is exactly the
+/// `test-fixtures` build's `constants::METADATA_SIGNER` (pinned by
+/// `test_metadata_signer_fixture_matches_seed_and_loaded_binary`) -- lets
+/// these LiteSVM tests build a genuine, Ed25519Program-verifiable attestation
+/// end-to-end, not a mock. Local-dev seed decoded from `apps/web/.env.local`'s
+/// `NFT_METADATA_SIGNER_SECRET` (first 32 of its 64 raw bytes); never the
+/// production signer.
 const METADATA_SIGNER_SEED: [u8; 32] = [107, 146, 155, 99, 84, 148, 132, 26, 123, 32, 235, 212, 14, 232, 10, 126, 174, 172, 109, 129, 74, 137, 101, 109, 139, 196, 51, 81, 183, 39, 216, 10];
 
 /// A different, valid ed25519 keypair whose public key does NOT match
@@ -551,10 +640,9 @@ fn test_lifecycle_challenge_outbid_flip_defend_withdraw() {
     assert_eq!(gs.top_bid_amount, bid_a);
     assert_eq!(gs.escrowed_amount, bid_a);
     assert_vault_invariant(&svm, vault, &gs);
-    let window_end_after_open = gs.window_end_ts;
 
-    // --- challenge: outbid by user_b, well before the snipe threshold -----
-    set_clock_ts(&mut svm, t0 + 10); // window_end - 20, not near the snipe threshold
+    // --- challenge: outbid by user_b, mid-window ----------------------------
+    set_clock_ts(&mut svm, t0 + 10);
     let bid_b = 1_102_500u64; // 1_050_000 * 1.05
     let prev_top_bidder_2 = get_global_state(&svm, global_state).top_bidder;
     let res = send(
@@ -575,8 +663,8 @@ fn test_lifecycle_challenge_outbid_flip_defend_withdraw() {
     assert_eq!(gs.top_bidder, user_b.pubkey());
     assert_eq!(gs.top_bid_amount, bid_b);
     assert_eq!(gs.escrowed_amount, bid_b);
-    // Not within the snipe-extend window, so the deadline must not move.
-    assert_eq!(gs.window_end_ts, window_end_after_open);
+    // Every bid resets the deadline to its own block time + base window.
+    assert_eq!(gs.window_end_ts, t0 + 10 + gs.base_window_secs as i64);
     assert_vault_invariant(&svm, vault, &gs);
 
     // --- settle: flip (user_b != holder(treasury)) -------------------------
@@ -590,7 +678,7 @@ fn test_lifecycle_challenge_outbid_flip_defend_withdraw() {
 
     let gs = get_global_state(&svm, global_state);
     assert_eq!(gs.holder, user_b.pubkey());
-    assert_eq!(gs.holder_since, t0 + 30);
+    assert_eq!(gs.holder_since, t0 + 40);
     assert!(gs.is_on); // flipped from false
     assert_eq!(gs.current_price, bid_b);
     assert!(!gs.window_active);
@@ -800,99 +888,144 @@ fn test_settle_before_window_end_boundary() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Snipe-extension boundary
+// 4. Window reset: every bid re-arms the deadline to `now + base_window_secs`
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_snipe_extension_triggers_and_accumulates() {
-    let (mut svm, global_state, vault, payer) = new_svm();
+/// Initializes the program and cold-opens a window at `t0` by `bidder1`; returns the post-open state.
+fn open_window_at(
+    svm: &mut LiteSVM,
+    global_state: Pubkey,
+    vault: Pubkey,
+    payer: &Keypair,
+    bidder1: &Keypair,
+    t0: i64,
+) -> GlobalState {
     let treasury = Keypair::new().pubkey();
     let admin = Keypair::new().pubkey();
+    set_clock_ts(svm, t0);
+    send(svm, payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
+    let res = send(svm, bidder1, ix_challenge(global_state, vault, bidder1.pubkey(), Pubkey::default(), 1_050_000));
+    let event = challenge_event(&res);
+    assert!(!event.extended, "a cold open must not report extended");
+    let gs = get_global_state(svm, global_state);
+    assert_eq!(event.window_end_ts, gs.window_end_ts);
+    gs
+}
+
+#[test]
+fn test_cold_open_sets_window_end_to_now_plus_base() {
+    let (mut svm, global_state, vault, payer) = new_svm();
     let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
-    let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
-    let bidder3 = new_funded_keypair(&mut svm, 10_000_000_000);
-
     let t0 = 1_000;
-    set_clock_ts(&mut svm, t0);
-    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
-    let prev_top_bidder_6 = get_global_state(&svm, global_state).top_bidder;
-    send(
-        &mut svm,
-        &bidder1,
-        ix_challenge(global_state, vault, bidder1.pubkey(), prev_top_bidder_6, 1_050_000),
-    )
-    .unwrap();
-
-    let gs = get_global_state(&svm, global_state);
-    let window_end_0 = gs.window_end_ts; // t0 + 30
-    let snipe_extend = gs.snipe_extend_secs as i64; // 10
-
-    // Bid exactly at window_end - snipe_extend_secs: must extend.
-    set_clock_ts(&mut svm, window_end_0 - snipe_extend);
-    let prev_top_bidder_7 = get_global_state(&svm, global_state).top_bidder;
-    send(
-        &mut svm,
-        &bidder2,
-        ix_challenge(global_state, vault, bidder2.pubkey(), prev_top_bidder_7, 1_102_500),
-    )
-    .unwrap();
-    let gs = get_global_state(&svm, global_state);
-    let window_end_1 = gs.window_end_ts;
-    assert_eq!(window_end_1, window_end_0 + snipe_extend, "should extend from the current end");
-    assert_vault_invariant(&svm, vault, &gs);
-
-    // A second late bid at the new threshold: must extend again, strictly further out
-    // (not reset to a fixed offset from `now`).
-    set_clock_ts(&mut svm, window_end_1 - snipe_extend);
-    let prev_top_bidder_8 = get_global_state(&svm, global_state).top_bidder;
-    send(
-        &mut svm,
-        &bidder3,
-        ix_challenge(global_state, vault, bidder3.pubkey(), prev_top_bidder_8, 1_157_625),
-    )
-    .unwrap();
-    let gs = get_global_state(&svm, global_state);
-    let window_end_2 = gs.window_end_ts;
-    assert_eq!(window_end_2, window_end_1 + snipe_extend);
-    assert!(window_end_2 > window_end_1 && window_end_1 > window_end_0);
+    let gs = open_window_at(&mut svm, global_state, vault, &payer, &bidder1, t0);
+    assert!(gs.window_active);
+    assert_eq!(gs.base_window_secs, 30);
+    assert_eq!(gs.window_end_ts, t0 + 30);
     assert_vault_invariant(&svm, vault, &gs);
 }
 
 #[test]
-fn test_snipe_extension_not_triggered_one_second_early() {
+fn test_mid_window_bid_resets_to_now_plus_base_at_any_offset() {
+    // Early, middle, and the last second before the deadline all behave identically.
+    for offset in [1i64, 15, 29] {
+        let (mut svm, global_state, vault, payer) = new_svm();
+        let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
+        let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+        let t0 = 1_000;
+        let gs0 = open_window_at(&mut svm, global_state, vault, &payer, &bidder1, t0);
+
+        let now = t0 + offset;
+        set_clock_ts(&mut svm, now);
+        let res = send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500));
+        let event = challenge_event(&res);
+
+        let gs = get_global_state(&svm, global_state);
+        assert_eq!(gs.window_end_ts, now + 30, "offset {offset}: must reset to now + base_window_secs");
+        assert!(gs.window_end_ts >= gs0.window_end_ts, "offset {offset}: deadline moved backward");
+        assert!(event.extended, "offset {offset}: a mid-window bid must report extended");
+        assert_eq!(event.window_end_ts, gs.window_end_ts);
+        assert_eq!(event.challenger, bidder2.pubkey());
+        assert_eq!(event.bid_amount, 1_102_500);
+        assert_vault_invariant(&svm, vault, &gs);
+    }
+}
+
+#[test]
+fn test_bid_at_or_after_deadline_is_rejected_and_window_settles() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let treasury = Keypair::new().pubkey();
-    let admin = Keypair::new().pubkey();
     let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
     let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let gs0 = open_window_at(&mut svm, global_state, vault, &payer, &bidder1, 1_000);
 
+    // Closing boundary is exclusive for bids: now == window_end_ts is already closed.
+    for now in [gs0.window_end_ts, gs0.window_end_ts + 1, gs0.window_end_ts + 3_600] {
+        set_clock_ts(&mut svm, now);
+        let res = send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500));
+        assert_err_contains(&res, "WindowClosedPendingSettlement");
+        let gs = get_global_state(&svm, global_state);
+        assert_eq!(gs.window_end_ts, gs0.window_end_ts, "a rejected bid must not move the deadline");
+        assert_eq!(gs.top_bidder, bidder1.pubkey());
+        assert_vault_invariant(&svm, vault, &gs);
+    }
+
+    // Pending settlement behaves exactly as before: settle at any time after the deadline wins.
+    let res = send(&mut svm, &bidder1, ix_settle(global_state, vault, bidder1.pubkey(), INCINERATOR, win_record_pda(gs0.holder_count)));
+    assert!(res.is_ok(), "{:?}", res.err());
+    let gs = get_global_state(&svm, global_state);
+    assert_eq!(gs.holder, bidder1.pubkey());
+    assert!(!gs.window_active);
+}
+
+#[test]
+fn test_settle_rejected_before_reset_deadline_then_double_settle_rejected() {
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
     let t0 = 1_000;
-    set_clock_ts(&mut svm, t0);
-    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
-    let prev_top_bidder_9 = get_global_state(&svm, global_state).top_bidder;
-    send(
-        &mut svm,
-        &bidder1,
-        ix_challenge(global_state, vault, bidder1.pubkey(), prev_top_bidder_9, 1_050_000),
-    )
-    .unwrap();
+    let gs0 = open_window_at(&mut svm, global_state, vault, &payer, &bidder1, t0);
+    let original_end = gs0.window_end_ts;
 
+    set_clock_ts(&mut svm, t0 + 20);
+    send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500)).unwrap();
     let gs = get_global_state(&svm, global_state);
-    let window_end_0 = gs.window_end_ts;
-    let snipe_extend = gs.snipe_extend_secs as i64;
+    let reset_end = gs.window_end_ts;
+    assert_eq!(reset_end, t0 + 50);
 
-    // One second earlier than the snipe threshold: must NOT extend.
-    set_clock_ts(&mut svm, window_end_0 - snipe_extend - 1);
-    let prev_top_bidder_10 = get_global_state(&svm, global_state).top_bidder;
-    send(
-        &mut svm,
-        &bidder2,
-        ix_challenge(global_state, vault, bidder2.pubkey(), prev_top_bidder_10, 1_102_500),
-    )
-    .unwrap();
+    // The original (pre-reset) deadline no longer closes the window.
+    for now in [original_end, reset_end - 1] {
+        set_clock_ts(&mut svm, now);
+        let res = send(&mut svm, &bidder2, ix_settle(global_state, vault, bidder2.pubkey(), INCINERATOR, win_record_pda(gs.holder_count)));
+        assert_err_contains(&res, "WindowNotClosed");
+    }
     let gs = get_global_state(&svm, global_state);
-    assert_eq!(gs.window_end_ts, window_end_0, "must not extend before the snipe threshold");
-    assert_vault_invariant(&svm, vault, &gs);
+    assert!(gs.window_active);
+    assert_eq!(gs.top_bidder, bidder2.pubkey());
+
+    set_clock_ts(&mut svm, reset_end);
+    let res = send(&mut svm, &bidder2, ix_settle(global_state, vault, bidder2.pubkey(), INCINERATOR, win_record_pda(gs.holder_count)));
+    assert!(res.is_ok(), "{:?}", res.err());
+    let gs = get_global_state(&svm, global_state);
+    assert_eq!(gs.holder, bidder2.pubkey());
+    assert_eq!(gs.holder_since, reset_end);
+
+    let res = send(&mut svm, &bidder2, ix_settle(global_state, vault, bidder2.pubkey(), INCINERATOR, win_record_pda(gs.holder_count)));
+    assert_err_contains(&res, "NoActiveWindow");
+    assert_vault_invariant(&svm, vault, &get_global_state(&svm, global_state));
+}
+
+#[test]
+fn test_global_state_account_size_matches_layout() {
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
+    open_window_at(&mut svm, global_state, vault, &payer, &bidder1, 1_000);
+    let account = svm.get_account(&global_state).unwrap();
+    // 8 discriminator + 244 field bytes exactly, no trailing slack.
+    assert_eq!(account.data.len(), 8 + 244);
+    let gs = GlobalState::try_deserialize(&mut account.data.as_slice()).unwrap();
+    let mut reserialized = Vec::new();
+    gs.serialize(&mut reserialized).unwrap();
+    assert_eq!(8 + reserialized.len(), account.data.len(), "declared space must equal the serialized layout");
+    assert_eq!(gs.top_bidder, bidder1.pubkey());
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,17 +1287,34 @@ fn test_self_reassign_ownership_does_not_block_challenge_and_refund_stays_claima
     // *destination* of the payout need not be System-owned, only the
     // *source* (the vault, earlier, and the pending_refund PDA here).
     let bidder1_balance_before = svm.get_balance(&bidder1.pubkey()).unwrap();
-    let res = send_with_signers(&mut svm, &payer, &[&payer, &bidder1], ix_claim_refund(bidder1.pubkey()));
+    let bidder2_balance_before = svm.get_balance(&bidder2.pubkey()).unwrap();
+    let res = send_with_signers(
+        &mut svm,
+        &payer,
+        &[&payer, &bidder1],
+        ix_claim_refund(bidder1.pubkey(), bidder2.pubkey()),
+    );
     assert!(res.is_ok(), "{:?}", res.err());
 
     let bidder1_balance_after = svm.get_balance(&bidder1.pubkey()).unwrap();
+    let bidder2_balance_after = svm.get_balance(&bidder2.pubkey()).unwrap();
     let pending_refund_rent = svm.minimum_balance_for_rent_exemption(PendingRefund::SPACE);
-    // bidder1 paid no tx fee (payer did), so the delta is exactly the
-    // refunded bid plus the reclaimed rent-exempt reserve -- no more, no less.
+    // bidder1 paid no tx fee (payer did), so the delta is exactly their own
+    // refunded bid -- no more, no less. The reclaimed rent-exempt reserve
+    // must NOT end up here: bidder1 never paid it, so bidder1 must never
+    // receive it (the bug this test now guards against).
     assert_eq!(
         bidder1_balance_after - bidder1_balance_before,
-        1_050_000 + pending_refund_rent,
-        "must receive exactly the refunded bid plus reclaimed rent"
+        1_050_000,
+        "claimant must receive exactly their own refunded bid, never the rent reserve"
+    );
+    // bidder2 is who actually paid to create bidder1's PendingRefund PDA
+    // (their outbid challenge triggered it) -- the reclaimed rent must
+    // return to bidder2, not vanish or go to bidder1.
+    assert_eq!(
+        bidder2_balance_after - bidder2_balance_before,
+        pending_refund_rent,
+        "rent-exempt reserve must return to whoever actually paid it"
     );
 
     assert!(
@@ -1459,22 +1609,23 @@ fn test_initialize_creates_genesis_win_record() {
 fn test_genesis_win_record_mint_win_nft_happy_path() {
     let (mut svm, global_state, vault, payer) = new_svm();
     let treasury_kp = new_funded_keypair(&mut svm, 10_000_000_000);
-    let admin = Keypair::new().pubkey();
+    let admin = new_funded_keypair(&mut svm, 10_000_000_000);
 
     set_clock_ts(&mut svm, 1_000);
     send(
         &mut svm,
         &payer,
-        ix_initialize(global_state, vault, payer.pubkey(), treasury_kp.pubkey(), admin, 1_000_000),
+        ix_initialize(global_state, vault, payer.pubkey(), treasury_kp.pubkey(), admin.pubkey(), 1_000_000),
     )
     .unwrap();
+    let collection = init_nft_collection_for_test(&mut svm, &admin, global_state);
 
     let genesis_win_record = genesis_win_record_pda();
     let asset = Keypair::new();
     let uri = "https://arweave.net/genesis".to_string();
     let content_hash = [99u8; 32];
     let ed25519_ix = ed25519_attestation_ix(&METADATA_SIGNER_SEED, &content_hash);
-    let mint_ix = ix_mint_win_nft(treasury_kp.pubkey(), genesis_win_record, asset.pubkey(), uri.clone(), content_hash);
+    let mint_ix = ix_mint_win_nft(treasury_kp.pubkey(), genesis_win_record, asset.pubkey(), collection, uri.clone(), content_hash);
     let res = send_multi(&mut svm, &treasury_kp, &[&treasury_kp, &asset], &[ed25519_ix, mint_ix]);
     assert!(res.is_ok(), "{:?}", res.err());
 
@@ -1488,8 +1639,8 @@ fn test_genesis_win_record_mint_win_nft_happy_path() {
     assert_eq!(parsed.owner, treasury_kp.pubkey());
     assert_eq!(
         parsed.update_authority,
-        mpl_core::types::UpdateAuthority::None,
-        "update authority must never be retained, same as any other Win NFT mint"
+        mpl_core::types::UpdateAuthority::Collection(collection),
+        "collection membership IS the update-authority mechanism in mpl-core, same as any other Win NFT mint"
     );
     assert_eq!(parsed.uri, uri);
 
@@ -1517,10 +1668,11 @@ fn test_genesis_win_record_mint_win_nft_happy_path() {
 fn test_genesis_win_record_rejects_non_treasury_caller() {
     let (mut svm, global_state, vault, payer) = new_svm();
     let treasury = Keypair::new().pubkey();
-    let admin = Keypair::new().pubkey();
+    let admin = new_funded_keypair(&mut svm, 10_000_000_000);
 
     set_clock_ts(&mut svm, 1_000);
-    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin.pubkey(), 1_000_000)).unwrap();
+    let collection = init_nft_collection_for_test(&mut svm, &admin, global_state);
 
     let impostor = new_funded_keypair(&mut svm, 10_000_000_000);
     let asset = Keypair::new();
@@ -1531,6 +1683,7 @@ fn test_genesis_win_record_rejects_non_treasury_caller() {
         impostor.pubkey(),
         genesis_win_record,
         asset.pubkey(),
+        collection,
         "https://arweave.net/x".to_string(),
         [0u8; 32],
     );
@@ -1670,20 +1823,19 @@ fn test_bid_storm_interleaved_late_bidders() {
     .unwrap();
 
     let gs = get_global_state(&svm, global_state);
-    let snipe_extend = gs.snipe_extend_secs as i64;
     let min_raise_bps = gs.min_raise_bps;
     let mut window_end = gs.window_end_ts;
     let mut base = gs.top_bid_amount;
 
-    // (offset from t0, expected to extend) - a dense, mixed-timing sequence
-    // straddling the snipe threshold on both sides.
-    let offsets_and_expect_extend = [(5i64, false), (20, true), (25, false), (30, true), (45, true)];
+    // Dense, mixed-timing offsets from t0: every one resets to its own now + base_window_secs.
+    let offsets = [5i64, 20, 25, 30, 45];
 
-    for (i, (offset, expect_extend)) in offsets_and_expect_extend.iter().enumerate() {
+    for (i, offset) in offsets.iter().enumerate() {
         let bidder = &bidders[i + 1];
         let bid = min_raise_amount(base, min_raise_bps);
+        let now = t0 + offset;
 
-        set_clock_ts(&mut svm, t0 + offset);
+        set_clock_ts(&mut svm, now);
         let prev_top_bidder_23 = get_global_state(&svm, global_state).top_bidder;
         let res = send(
             &mut svm,
@@ -1693,11 +1845,7 @@ fn test_bid_storm_interleaved_late_bidders() {
         assert!(res.is_ok(), "bid {i} failed: {:?}", res.err());
 
         let gs = get_global_state(&svm, global_state);
-        if *expect_extend {
-            assert_eq!(gs.window_end_ts, window_end + snipe_extend, "bid {i} should extend");
-        } else {
-            assert_eq!(gs.window_end_ts, window_end, "bid {i} should not extend");
-        }
+        assert_eq!(gs.window_end_ts, now + gs.base_window_secs as i64, "bid {i} should reset");
         // Monotonic: the window end only ever moves forward, never shortens.
         assert!(gs.window_end_ts >= window_end);
         window_end = gs.window_end_ts;
@@ -1774,120 +1922,87 @@ fn test_bid_storm_same_bidder_repeated() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. Snipe-extension exact boundary
+// 14. Window reset: sustained bidding and independence from the prior deadline
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_snipe_extension_exact_threshold_tie() {
-    // Side A: bid lands exactly at the `>=` boundary - must extend.
-    {
-        let (mut svm, global_state, vault, payer) = new_svm();
-        let treasury = Keypair::new().pubkey();
-        let admin = Keypair::new().pubkey();
-        let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
-        let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+fn test_bid_storm_keeps_resetting_until_bidding_stops() {
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let bidders: Vec<Keypair> = (0..12).map(|_| new_funded_keypair(&mut svm, 10_000_000_000)).collect();
+    let t0 = 1_000;
+    let gs = open_window_at(&mut svm, global_state, vault, &payer, &bidders[0], t0);
+    let min_raise_bps = gs.min_raise_bps;
+    let mut window_end = gs.window_end_ts;
+    let mut base = gs.top_bid_amount;
+    let mut now = t0;
 
-        let t0 = 1_000;
-        set_clock_ts(&mut svm, t0);
-        send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
-        let prev_top_bidder_28 = get_global_state(&svm, global_state).top_bidder;
-        send(
-            &mut svm,
-            &bidder1,
-            ix_challenge(global_state, vault, bidder1.pubkey(), prev_top_bidder_28, 1_050_000),
-        )
-        .unwrap();
-
+    // Each bid lands 29s after the previous one, so the window outlives many base windows.
+    for (i, bidder) in bidders.iter().enumerate().skip(1) {
+        now += 29;
+        assert!(now < window_end, "bid {i} should still be inside the window");
+        set_clock_ts(&mut svm, now);
+        let bid = min_raise_amount(base, min_raise_bps);
+        let res = send(&mut svm, bidder, ix_challenge(global_state, vault, bidder.pubkey(), bidders[i - 1].pubkey(), bid));
+        let event = challenge_event(&res);
         let gs = get_global_state(&svm, global_state);
-        let window_end = gs.window_end_ts;
-        let snipe_extend = gs.snipe_extend_secs as i64;
-
-        set_clock_ts(&mut svm, window_end - snipe_extend);
-        let prev_top_bidder_29 = get_global_state(&svm, global_state).top_bidder;
-        send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), prev_top_bidder_29, 1_102_500)).unwrap();
-
-        let gs = get_global_state(&svm, global_state);
-        assert_eq!(gs.window_end_ts, window_end + snipe_extend, "exact tie must extend");
+        assert_eq!(gs.window_end_ts, now + 30, "bid {i}");
+        assert!(gs.window_end_ts > window_end, "bid {i}: deadline must move strictly forward here");
+        assert!(event.extended);
+        window_end = gs.window_end_ts;
+        base = bid;
         assert_vault_invariant(&svm, vault, &gs);
     }
+    assert!(window_end - t0 > 10 * 30, "sustained bidding should keep the window open far past one base window");
 
-    // Side B: one second earlier than the tie - must not extend.
-    {
-        let (mut svm, global_state, vault, payer) = new_svm();
-        let treasury = Keypair::new().pubkey();
-        let admin = Keypair::new().pubkey();
-        let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
-        let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let last = bidders.last().unwrap();
+    set_clock_ts(&mut svm, window_end - 1);
+    let res = send(&mut svm, last, ix_settle(global_state, vault, last.pubkey(), INCINERATOR, win_record_pda(1)));
+    assert_err_contains(&res, "WindowNotClosed");
+    set_clock_ts(&mut svm, window_end);
+    let res = send(&mut svm, last, ix_settle(global_state, vault, last.pubkey(), INCINERATOR, win_record_pda(1)));
+    assert!(res.is_ok(), "{:?}", res.err());
+    assert_eq!(get_global_state(&svm, global_state).holder, last.pubkey());
+}
 
-        let t0 = 1_000;
-        set_clock_ts(&mut svm, t0);
-        send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
-        let prev_top_bidder_30 = get_global_state(&svm, global_state).top_bidder;
-        send(
-            &mut svm,
-            &bidder1,
-            ix_challenge(global_state, vault, bidder1.pubkey(), prev_top_bidder_30, 1_050_000),
-        )
-        .unwrap();
-
-        let gs = get_global_state(&svm, global_state);
-        let window_end = gs.window_end_ts;
-        let snipe_extend = gs.snipe_extend_secs as i64;
-
-        set_clock_ts(&mut svm, window_end - snipe_extend - 1);
-        let prev_top_bidder_31 = get_global_state(&svm, global_state).top_bidder;
-        send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), prev_top_bidder_31, 1_102_500)).unwrap();
-
-        let gs = get_global_state(&svm, global_state);
-        assert_eq!(gs.window_end_ts, window_end, "one second early must not extend");
-        assert_vault_invariant(&svm, vault, &gs);
+#[test]
+fn test_same_second_bids_reset_to_the_same_deadline() {
+    // Several bids in one block time: the deadline never moves backward and never stacks.
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let bidders: Vec<Keypair> = (0..4).map(|_| new_funded_keypair(&mut svm, 10_000_000_000)).collect();
+    let t0 = 1_000;
+    let gs = open_window_at(&mut svm, global_state, vault, &payer, &bidders[0], t0);
+    let mut base = gs.top_bid_amount;
+    set_clock_ts(&mut svm, t0 + 12);
+    for (i, bidder) in bidders.iter().enumerate().skip(1) {
+        let bid = min_raise_amount(base, gs.min_raise_bps);
+        send(&mut svm, bidder, ix_challenge(global_state, vault, bidder.pubkey(), bidders[i - 1].pubkey(), bid)).unwrap();
+        assert_eq!(get_global_state(&svm, global_state).window_end_ts, t0 + 42, "bid {i}");
+        base = bid;
     }
 }
 
 #[test]
-fn test_snipe_extension_extends_from_current_end_not_now() {
+fn test_window_reset_ignores_prior_window_end_ts() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let treasury = Keypair::new().pubkey();
-    let admin = Keypair::new().pubkey();
     let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
     let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
     let bidder3 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let gs = open_window_at(&mut svm, global_state, vault, &payer, &bidder1, 1_000);
 
-    let t0 = 1_000;
-    set_clock_ts(&mut svm, t0);
-    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
-    let prev_top_bidder_32 = get_global_state(&svm, global_state).top_bidder;
-    send(
-        &mut svm,
-        &bidder1,
-        ix_challenge(global_state, vault, bidder1.pubkey(), prev_top_bidder_32, 1_050_000),
-    )
-    .unwrap();
+    // Timed so the retired "push the current end out by 10s" rule would give a different answer.
+    let bid2_ts = gs.window_end_ts - 5;
+    set_clock_ts(&mut svm, bid2_ts);
+    send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500)).unwrap();
+    let gs2 = get_global_state(&svm, global_state);
+    assert_eq!(gs2.window_end_ts, bid2_ts + 30);
+    assert_ne!(gs2.window_end_ts, gs.window_end_ts + 10);
 
-    let gs = get_global_state(&svm, global_state);
-    let window_end_0 = gs.window_end_ts; // t0 + 30
-    let snipe_extend = gs.snipe_extend_secs as i64; // 10
-
-    // First late bid, 5s past the threshold (not exactly on it).
-    set_clock_ts(&mut svm, window_end_0 - snipe_extend + 5);
-    let prev_top_bidder_33 = get_global_state(&svm, global_state).top_bidder;
-    send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), prev_top_bidder_33, 1_102_500)).unwrap();
-    let gs = get_global_state(&svm, global_state);
-    let window_end_1 = gs.window_end_ts;
-    assert_eq!(window_end_1, window_end_0 + snipe_extend);
-
-    // Second late bid, again 5s past the (new) threshold. If the extension
-    // were computed from `now + snipe_extend_secs` instead of the current
-    // `window_end_ts + snipe_extend_secs`, this would land 5s short of the
-    // correct value - this assertion would catch that regression.
-    let now2 = window_end_1 - snipe_extend + 5;
-    set_clock_ts(&mut svm, now2);
-    let prev_top_bidder_34 = get_global_state(&svm, global_state).top_bidder;
-    send(&mut svm, &bidder3, ix_challenge(global_state, vault, bidder3.pubkey(), prev_top_bidder_34, 1_157_625)).unwrap();
-    let gs = get_global_state(&svm, global_state);
-    assert_eq!(gs.window_end_ts, window_end_1 + snipe_extend, "must extend from window_end_ts, not now");
-    assert_ne!(gs.window_end_ts, now2 + snipe_extend, "must not extend from now");
-    assert_vault_invariant(&svm, vault, &gs);
+    let bid3_ts = bid2_ts + 25;
+    set_clock_ts(&mut svm, bid3_ts);
+    send(&mut svm, &bidder3, ix_challenge(global_state, vault, bidder3.pubkey(), bidder2.pubkey(), 1_157_625)).unwrap();
+    let gs3 = get_global_state(&svm, global_state);
+    assert_eq!(gs3.window_end_ts, bid3_ts + 30);
+    assert_vault_invariant(&svm, vault, &gs3);
 }
 
 // ---------------------------------------------------------------------------
@@ -2229,18 +2344,30 @@ fn test_claim_refund_happy_path_pays_exact_amount_and_closes_account() {
 
     let gs_before = get_global_state(&svm, global_state);
     let bidder1_balance_before = svm.get_balance(&bidder1.pubkey()).unwrap();
+    let bidder2_balance_before = svm.get_balance(&bidder2.pubkey()).unwrap();
     let pending_refund_rent = svm.minimum_balance_for_rent_exemption(PendingRefund::SPACE);
 
-    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey()));
+    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey(), bidder2.pubkey()));
     assert!(res.is_ok(), "{:?}", res.err());
 
     let bidder1_balance_after = svm.get_balance(&bidder1.pubkey()).unwrap();
     // bidder1 itself paid the tx fee here, so allow for that (bounded, unlike
-    // a silent short-payment which would be far larger than any fee).
+    // a silent short-payment which would be far larger than any fee) -- but
+    // must never exceed exactly its own refunded bid: the rent reserve is
+    // bidder2's money, never bidder1's, no matter how the tx fee lands.
     let received = bidder1_balance_after - bidder1_balance_before;
     assert!(
-        received > 1_050_000 && received <= 1_050_000 + pending_refund_rent,
-        "expected refund + reclaimed rent minus tx fee, got {received}"
+        received > 0 && received <= 1_050_000,
+        "claimant must receive at most exactly its own refunded bid, got {received}"
+    );
+
+    // bidder2 -- who actually paid to create this PendingRefund PDA when
+    // its outbid challenge landed -- must get the reclaimed rent back.
+    let bidder2_balance_after = svm.get_balance(&bidder2.pubkey()).unwrap();
+    assert_eq!(
+        bidder2_balance_after - bidder2_balance_before,
+        pending_refund_rent,
+        "rent-exempt reserve must return to whoever actually paid it, not the claimant"
     );
 
     assert!(
@@ -2281,7 +2408,7 @@ fn test_claim_refund_twice_fails_second_time() {
     )
     .unwrap();
 
-    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey()));
+    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey(), bidder2.pubkey()));
     assert!(res.is_ok(), "{:?}", res.err());
 
     let balance_after_first_claim = svm.get_balance(&bidder1.pubkey()).unwrap();
@@ -2290,7 +2417,7 @@ fn test_claim_refund_twice_fails_second_time() {
     // (Anchor's own account-deserialization safety - a closed account's
     // discriminator no longer matches `PendingRefund`), not pay out
     // anything, and not panic.
-    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey()));
+    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey(), bidder2.pubkey()));
     assert!(res.is_err(), "second claim must fail");
 
     // No stray lamports moved on the failed attempt (aside from the tx fee
@@ -2320,7 +2447,13 @@ fn test_claim_refund_with_nothing_pending_fails_cleanly() {
     // This account's `PendingRefund` PDA was never created - there is
     // nothing to deserialize. Must fail cleanly (an ordinary Anchor account
     // error, not a panic) and pay out nothing.
-    let res = send(&mut svm, &never_outbid_anyone, ix_claim_refund(never_outbid_anyone.pubkey()));
+    // rent_payer is a don't-care here: the account never existed, so
+    // deserialization fails before any `address` constraint is reached.
+    let res = send(
+        &mut svm,
+        &never_outbid_anyone,
+        ix_claim_refund(never_outbid_anyone.pubkey(), never_outbid_anyone.pubkey()),
+    );
     assert!(res.is_err(), "claiming with nothing pending must fail");
 
     let balance_after = svm.get_balance(&never_outbid_anyone.pubkey()).unwrap();
@@ -2359,7 +2492,7 @@ fn test_claim_refund_by_someone_else_fails() {
     // to the attacker's own key. The on-chain `constraint = pending_refund.bidder
     // == claimant.key()` check must reject this since `attacker.key() !=
     // bidder1.pubkey()`.
-    let mut ix = ix_claim_refund(bidder1.pubkey());
+    let mut ix = ix_claim_refund(bidder1.pubkey(), bidder2.pubkey());
     ix.accounts[0].pubkey = attacker.pubkey();
     let res = send(&mut svm, &attacker, ix);
     assert_err_contains(&res, "NothingToRefund");
@@ -2410,12 +2543,25 @@ fn test_two_distinct_unclaimed_refunds_tracked_independently() {
     assert_vault_invariant(&svm, vault, &gs);
 
     // Claim b's refund first (out of order relative to when it became
-    // pending) - must not disturb a's still-pending refund at all.
+    // pending) - must not disturb a's still-pending refund at all. b's
+    // PendingRefund PDA was created by c's outbidding challenge, so c is the
+    // rent_payer here.
+    let pending_refund_rent = svm.minimum_balance_for_rent_exemption(PendingRefund::SPACE);
     let b_balance_before = svm.get_balance(&b.pubkey()).unwrap();
-    let res = send(&mut svm, &b, ix_claim_refund(b.pubkey()));
+    let c_balance_before = svm.get_balance(&c.pubkey()).unwrap();
+    let res = send(&mut svm, &b, ix_claim_refund(b.pubkey(), c.pubkey()));
     assert!(res.is_ok(), "{:?}", res.err());
     let b_balance_after = svm.get_balance(&b.pubkey()).unwrap();
-    assert!(b_balance_after > b_balance_before, "b must have received its refund");
+    assert!(
+        b_balance_after - b_balance_before <= bid_b,
+        "b must receive at most exactly its own refunded bid, never c's rent"
+    );
+    let c_balance_after = svm.get_balance(&c.pubkey()).unwrap();
+    assert_eq!(
+        c_balance_after - c_balance_before,
+        pending_refund_rent,
+        "c paid to create b's PendingRefund PDA, so c must get the rent back"
+    );
     assert!(
         get_pending_refund(&svm, pending_refund_pda(b.pubkey())).is_none(),
         "b's refund account must be closed"
@@ -2428,12 +2574,25 @@ fn test_two_distinct_unclaimed_refunds_tracked_independently() {
     let gs = get_global_state(&svm, global_state);
     assert_vault_invariant(&svm, vault, &gs);
 
-    // a can still claim afterward, for exactly its own original amount.
+    // a can still claim afterward, for exactly its own original amount. a's
+    // PendingRefund PDA was created by b's outbidding challenge, so b is the
+    // rent_payer here (b having just claimed its own refund doesn't change
+    // who paid for a's PDA).
     let a_balance_before = svm.get_balance(&a.pubkey()).unwrap();
-    let res = send(&mut svm, &a, ix_claim_refund(a.pubkey()));
+    let b_balance_before_a_claims = svm.get_balance(&b.pubkey()).unwrap();
+    let res = send(&mut svm, &a, ix_claim_refund(a.pubkey(), b.pubkey()));
     assert!(res.is_ok(), "{:?}", res.err());
     let a_balance_after = svm.get_balance(&a.pubkey()).unwrap();
-    assert!(a_balance_after > a_balance_before, "a must have received its own refund");
+    assert!(
+        a_balance_after - a_balance_before <= bid_a,
+        "a must receive at most exactly its own refunded bid, never b's rent"
+    );
+    let b_balance_after_a_claims = svm.get_balance(&b.pubkey()).unwrap();
+    assert_eq!(
+        b_balance_after_a_claims - b_balance_before_a_claims,
+        pending_refund_rent,
+        "b paid to create a's PendingRefund PDA, so b must get the rent back"
+    );
     assert!(get_pending_refund(&svm, pending_refund_pda(a.pubkey())).is_none());
 
     let gs = get_global_state(&svm, global_state);
@@ -2470,22 +2629,183 @@ fn test_pending_refund_rent_exemption_maintained_and_reclaimed_on_claim() {
     assert_eq!(pda_lamports, rent + 1_050_000, "PDA balance must be exactly rent + owed amount");
 
     let bidder1_balance_before = svm.get_balance(&bidder1.pubkey()).unwrap();
-    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey()));
+    let bidder2_balance_before = svm.get_balance(&bidder2.pubkey()).unwrap();
+    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey(), bidder2.pubkey()));
     assert!(res.is_ok(), "{:?}", res.err());
     let bidder1_balance_after = svm.get_balance(&bidder1.pubkey()).unwrap();
 
-    // bidder1 must have actually received the reclaimed rent, not just the
-    // bid amount (minus the tx fee it itself paid to submit the claim).
+    // bidder1 must receive exactly its own refunded bid -- never the
+    // reclaimed rent, which belongs to bidder2 (who actually paid it).
     let received = bidder1_balance_after - bidder1_balance_before;
     assert!(
-        received > 1_050_000,
-        "claimant must receive more than the bare refund amount (the reclaimed rent), got {received}"
+        received > 0 && received <= 1_050_000,
+        "claimant must receive at most exactly the bare refund amount, got {received}"
+    );
+    let bidder2_balance_after = svm.get_balance(&bidder2.pubkey()).unwrap();
+    assert_eq!(
+        bidder2_balance_after - bidder2_balance_before,
+        rent,
+        "bidder2 paid this PDA's rent, so bidder2 must receive it back on close"
     );
     let pda_after = svm.get_account(&pda);
     assert!(
         pda_after.is_none() || pda_after.unwrap().lamports == 0,
         "pending_refund PDA must be fully drained on close"
     );
+}
+
+#[test]
+fn test_claim_refund_wrong_rent_payer_account_fails() {
+    // Guards the fix's own access control: a claimant cannot redirect the
+    // reclaimed rent reserve to themselves (or anyone else) by simply
+    // supplying a different `rent_payer` account than the one recorded
+    // on-chain.
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let treasury = Keypair::new().pubkey();
+    let admin = Keypair::new().pubkey();
+    let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let attacker = new_funded_keypair(&mut svm, 10_000_000_000);
+
+    set_clock_ts(&mut svm, 1_000);
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
+    send(
+        &mut svm,
+        &bidder1,
+        ix_challenge(global_state, vault, bidder1.pubkey(), Pubkey::default(), 1_050_000),
+    )
+    .unwrap();
+    send(
+        &mut svm,
+        &bidder2,
+        ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500),
+    )
+    .unwrap();
+
+    // bidder1 (the real claimant, signing legitimately) tries to claim while
+    // pointing `rent_payer` at the attacker instead of the real payer,
+    // bidder2. Must be rejected outright, not silently redirect the rent.
+    let attacker_balance_before = svm.get_balance(&attacker.pubkey()).unwrap();
+    let res = send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey(), attacker.pubkey()));
+    assert_err_contains(&res, "InvalidRentPayer");
+
+    let attacker_balance_after = svm.get_balance(&attacker.pubkey()).unwrap();
+    assert_eq!(attacker_balance_after, attacker_balance_before, "attacker must receive nothing");
+
+    // bidder1's refund must still be completely intact and claimable.
+    let refund = get_pending_refund(&svm, pending_refund_pda(bidder1.pubkey())).expect("refund should still be pending");
+    assert_eq!(refund.amount, 1_050_000);
+    assert_eq!(refund.rent_payer, bidder2.pubkey());
+    let gs = get_global_state(&svm, global_state);
+    assert_vault_invariant(&svm, vault, &gs);
+}
+
+#[test]
+fn test_rent_payer_unchanged_by_repeated_outbids_before_claim() {
+    // The accumulate-only path in challenge() (an already-initialized
+    // PendingRefund gaining a second, third, ... outbid before its owner
+    // ever claims) must never touch rent_payer -- only the very first
+    // creation sets it. Whoever paid to open the locker gets it back,
+    // regardless of how many subsequent challengers pile more amount in.
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let treasury = Keypair::new().pubkey();
+    let admin = Keypair::new().pubkey();
+    let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder3 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder4 = new_funded_keypair(&mut svm, 10_000_000_000);
+
+    set_clock_ts(&mut svm, 1_000);
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
+
+    // bidder1 opens, bidder2 outbids bidder1 (bidder2 pays bidder1's PDA
+    // rent -- rent_payer = bidder2). bidder1 never claims in between.
+    send(&mut svm, &bidder1, ix_challenge(global_state, vault, bidder1.pubkey(), Pubkey::default(), 1_050_000)).unwrap();
+    send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500)).unwrap();
+
+    let refund = get_pending_refund(&svm, pending_refund_pda(bidder1.pubkey())).unwrap();
+    assert_eq!(refund.rent_payer, bidder2.pubkey(), "first outbid's payer must be recorded");
+
+    // Outbid bidder1 has no way to happen again directly (bidder1 is no
+    // longer top_bidder) -- but the same scenario for bidder2's own PDA
+    // (created once by bidder3, then bidder2 stays unclaimed while bidder4
+    // outbids bidder3) proves the accumulate path leaves an EXISTING
+    // account's rent_payer alone: only bidder2's account here was ever
+    // freshly created, so re-assert it's still bidder2 after further,
+    // unrelated activity elsewhere in the window.
+    let gs = get_global_state(&svm, global_state);
+    let bid_c = min_raise_amount(gs.top_bid_amount, gs.min_raise_bps);
+    send(&mut svm, &bidder3, ix_challenge(global_state, vault, bidder3.pubkey(), bidder2.pubkey(), bid_c)).unwrap();
+    let gs = get_global_state(&svm, global_state);
+    let bid_d = min_raise_amount(gs.top_bid_amount, gs.min_raise_bps);
+    send(&mut svm, &bidder4, ix_challenge(global_state, vault, bidder4.pubkey(), bidder3.pubkey(), bid_d)).unwrap();
+
+    let refund_after = get_pending_refund(&svm, pending_refund_pda(bidder1.pubkey())).unwrap();
+    assert_eq!(
+        refund_after.rent_payer,
+        bidder2.pubkey(),
+        "rent_payer must stay bidder2 regardless of later, unrelated challenges"
+    );
+    assert_eq!(refund_after.amount, 1_050_000, "bidder1's own amount must be untouched by unrelated activity");
+
+    let gs = get_global_state(&svm, global_state);
+    assert_vault_invariant(&svm, vault, &gs);
+}
+
+#[test]
+fn test_rent_payer_resets_after_claim_and_fresh_reopen() {
+    // Once a PendingRefund account is closed (claimed), a later fresh outbid
+    // of the same bidder creates a brand-new account with a brand-new
+    // rent_payer -- the field must never "stick" to whoever paid the first
+    // time across a full close/reopen cycle.
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let treasury = Keypair::new().pubkey();
+    let admin = Keypair::new().pubkey();
+    let bidder1 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder2 = new_funded_keypair(&mut svm, 10_000_000_000);
+    let bidder3 = new_funded_keypair(&mut svm, 10_000_000_000);
+
+    set_clock_ts(&mut svm, 1_000);
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
+
+    // Round 1: bidder1 opens, bidder2 outbids (rent_payer = bidder2).
+    send(&mut svm, &bidder1, ix_challenge(global_state, vault, bidder1.pubkey(), Pubkey::default(), 1_050_000)).unwrap();
+    send(&mut svm, &bidder2, ix_challenge(global_state, vault, bidder2.pubkey(), bidder1.pubkey(), 1_102_500)).unwrap();
+    let refund = get_pending_refund(&svm, pending_refund_pda(bidder1.pubkey())).unwrap();
+    assert_eq!(refund.rent_payer, bidder2.pubkey());
+
+    // bidder1 claims -- account fully closes.
+    send(&mut svm, &bidder1, ix_claim_refund(bidder1.pubkey(), bidder2.pubkey())).unwrap();
+    assert!(get_pending_refund(&svm, pending_refund_pda(bidder1.pubkey())).is_none());
+
+    // Round 2: bidder1 re-enters and wins again, then is outbid by a
+    // DIFFERENT bidder (bidder3) -- bidder1's PendingRefund PDA is created
+    // fresh, so its rent_payer must be bidder3 this time, not bidder2.
+    let gs = get_global_state(&svm, global_state);
+    send(
+        &mut svm,
+        &bidder1,
+        ix_challenge(global_state, vault, bidder1.pubkey(), gs.top_bidder, min_raise_amount(gs.top_bid_amount, gs.min_raise_bps)),
+    )
+    .unwrap();
+    let gs = get_global_state(&svm, global_state);
+    send(
+        &mut svm,
+        &bidder3,
+        ix_challenge(global_state, vault, bidder3.pubkey(), bidder1.pubkey(), min_raise_amount(gs.top_bid_amount, gs.min_raise_bps)),
+    )
+    .unwrap();
+
+    let refund_round2 = get_pending_refund(&svm, pending_refund_pda(bidder1.pubkey()))
+        .expect("bidder1 should have a fresh pending refund");
+    assert_eq!(
+        refund_round2.rent_payer,
+        bidder3.pubkey(),
+        "a freshly reopened account must record its NEW payer, not the old one"
+    );
+
+    let gs = get_global_state(&svm, global_state);
+    assert_vault_invariant(&svm, vault, &gs);
 }
 
 // ===========================================================================
@@ -4023,6 +4343,37 @@ fn settle_one_flip(svm: &mut LiteSVM, global_state: Pubkey, vault: Pubkey, payer
     (winner, win_record)
 }
 
+/// Same as `settle_one_flip`, plus a real (not throwaway-pubkey) admin
+/// keypair and an initialized Win NFT collection -- for every test that goes
+/// on to call `mint_win_nft`, since that now requires the collection to
+/// already exist.
+fn settle_one_flip_with_collection(
+    svm: &mut LiteSVM,
+    global_state: Pubkey,
+    vault: Pubkey,
+    payer: &Keypair,
+) -> (Keypair, Pubkey, Pubkey) {
+    let treasury = Keypair::new().pubkey();
+    let admin = new_funded_keypair(svm, 10_000_000_000);
+    set_clock_ts(svm, 1_000);
+    send(svm, payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin.pubkey(), 1_000_000)).unwrap();
+
+    let collection = init_nft_collection_for_test(svm, &admin, global_state);
+
+    let winner = new_funded_keypair(svm, 10_000_000_000);
+    let gs0 = get_global_state(svm, global_state);
+    let bid = min_raise_amount(gs0.current_price, gs0.min_raise_bps);
+    send(svm, &winner, ix_challenge(global_state, vault, winner.pubkey(), Pubkey::default(), bid)).unwrap();
+
+    let gs = get_global_state(svm, global_state);
+    set_clock_ts(svm, gs.window_end_ts);
+    let win_record = win_record_pda(gs.holder_count);
+    let res = send(svm, &winner, ix_settle(global_state, vault, winner.pubkey(), INCINERATOR, win_record));
+    assert!(res.is_ok(), "settle_one_flip_with_collection: {:?}", res.err());
+
+    (winner, win_record, collection)
+}
+
 #[test]
 fn test_settle_creates_win_record_only_on_flip_at_pre_increment_pda() {
     let (mut svm, global_state, vault, payer) = new_svm();
@@ -4103,6 +4454,23 @@ fn test_settle_creates_win_record_only_on_flip_at_pre_increment_pda() {
 }
 
 #[test]
+fn test_metadata_signer_fixture_matches_seed_and_loaded_binary() {
+    // Pins seed, host constant, and the SBF binary together so none can drift silently.
+    const FIXTURE_SIGNER: Pubkey = anchor_lang::prelude::pubkey!("CmgGk8qipHS9bVSyD5e7PRyApBAh9k8cg4oGkyfk6xRB");
+    const PRODUCTION_SIGNER: Pubkey = anchor_lang::prelude::pubkey!("BprArV2odeb24pizwVyYK4K8hGfjmHZxpsGUdykU2HZK");
+    let derived = Pubkey::new_from_array(SigningKey::from_bytes(&METADATA_SIGNER_SEED).verifying_key().to_bytes());
+    assert_eq!(derived, FIXTURE_SIGNER, "METADATA_SIGNER_SEED no longer derives the fixture pubkey");
+    assert_eq!(METADATA_SIGNER, FIXTURE_SIGNER, "host crate not built with the `test-fixtures` feature");
+
+    let so: &[u8] = include_bytes!("../target/deploy-test-fixtures/toggld.so");
+    let contains = |key: &Pubkey| so.windows(32).any(|w| w == key.as_ref());
+    assert!(
+        contains(&FIXTURE_SIGNER) && !contains(&PRODUCTION_SIGNER),
+        "target/deploy-test-fixtures/toggld.so is not a `test-fixtures` build; rebuild it (see this file's header)"
+    );
+}
+
+#[test]
 fn test_mint_win_nft_happy_path_creates_immutable_core_asset() {
     // Sanity check on the test fixture itself: the seed's derived public key
     // really is the same `METADATA_SIGNER` baked into the program constant,
@@ -4112,13 +4480,13 @@ fn test_mint_win_nft_happy_path_creates_immutable_core_asset() {
     assert_eq!(derived_signer, METADATA_SIGNER);
 
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let asset = Keypair::new();
     let uri = "https://arweave.net/abc123".to_string();
     let content_hash = [42u8; 32];
     let ed25519_ix = ed25519_attestation_ix(&METADATA_SIGNER_SEED, &content_hash);
-    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), uri.clone(), content_hash);
+    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), collection, uri.clone(), content_hash);
     let res = send_multi(&mut svm, &winner, &[&winner, &asset], &[ed25519_ix, mint_ix]);
     assert!(res.is_ok(), "{:?}", res.err());
 
@@ -4126,7 +4494,7 @@ fn test_mint_win_nft_happy_path_creates_immutable_core_asset() {
     assert!(record.minted, "WinRecord.minted must flip to true after a successful mint");
 
     // The asset account must now be a real, owned-by-mpl-core Core asset --
-    // owned by the winner, permanently immutable (no update authority), and
+    // owned by the winner, a genuine member of the shared collection, and
     // carrying the exact uri supplied.
     let asset_account = svm.get_account(&asset.pubkey()).expect("asset account must exist after CreateV1");
     assert_eq!(asset_account.owner, mpl_core::ID);
@@ -4135,23 +4503,28 @@ fn test_mint_win_nft_happy_path_creates_immutable_core_asset() {
     assert_eq!(parsed.owner, winner.pubkey());
     assert_eq!(
         parsed.update_authority,
-        mpl_core::types::UpdateAuthority::None,
-        "update authority must never be retained -- snapshot-once, immutable, matches the locked decision"
+        mpl_core::types::UpdateAuthority::Collection(collection),
+        "collection membership IS the update-authority mechanism in mpl-core -- this must point at the shared collection"
     );
     assert_eq!(parsed.uri, uri);
 
     // Mechanism 1 -- the Attributes plugin must carry the exact WinRecord
     // ground truth, unforgeable and independent of anything the client
     // uploaded off-chain, plus the metadata_hash attestation from Mechanism 2.
+    // Its own plugin authority must be `None` -- permanently frozen
+    // regardless of who controls the collection's authority.
     let full_asset = mpl_core::Asset::deserialize(&asset_account.data).expect("asset data must parse with plugins");
-    let attrs = full_asset
+    let attributes_registry = full_asset
         .plugin_list
         .attributes
         .as_ref()
-        .expect("Attributes plugin must be present")
-        .attributes
-        .attribute_list
-        .clone();
+        .expect("Attributes plugin must be present");
+    assert_eq!(
+        attributes_registry.base.authority.authority_type,
+        mpl_core::AuthorityType::None,
+        "Attributes plugin authority must be None -- permanently frozen independent of collection authority"
+    );
+    let attrs = attributes_registry.attributes.attribute_list.clone();
     let find = |key: &str| attrs.iter().find(|a| a.key == key).map(|a| a.value.clone());
     assert_eq!(find("winner"), Some(record.winner.to_string()));
     assert_eq!(find("holder_count"), Some(record.holder_count.to_string()));
@@ -4159,19 +4532,24 @@ fn test_mint_win_nft_happy_path_creates_immutable_core_asset() {
     assert_eq!(find("won_at"), Some(record.won_at.to_string()));
     let expected_hex: String = content_hash.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(find("metadata_hash"), Some(expected_hex));
+
+    assert!(
+        full_asset.plugin_list.immutable_metadata.is_some(),
+        "ImmutableMetadata plugin must be present -- permanently freezes name/uri too"
+    );
 }
 
 #[test]
 fn test_mint_win_nft_rejects_non_owner_caller() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (_winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (_winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let impostor = new_funded_keypair(&mut svm, 10_000_000_000);
     let asset = Keypair::new();
     // No Ed25519 attestation needed: `NotWinRecordOwner` is checked before
     // the metadata-signature check, so this must fail on that first, never
     // reaching Mechanism 2 at all.
-    let ix = ix_mint_win_nft(impostor.pubkey(), win_record, asset.pubkey(), "https://arweave.net/x".to_string(), [0u8; 32]);
+    let ix = ix_mint_win_nft(impostor.pubkey(), win_record, asset.pubkey(), collection, "https://arweave.net/x".to_string(), [0u8; 32]);
     let res = send_with_signers(&mut svm, &impostor, &[&impostor, &asset], ix);
     assert_err_contains(&res, "NotWinRecordOwner");
 
@@ -4182,7 +4560,7 @@ fn test_mint_win_nft_rejects_non_owner_caller() {
 #[test]
 fn test_mint_win_nft_rejects_double_mint() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let asset1 = Keypair::new();
     let content_hash1 = [11u8; 32];
@@ -4191,6 +4569,7 @@ fn test_mint_win_nft_rejects_double_mint() {
         winner.pubkey(),
         win_record,
         asset1.pubkey(),
+        collection,
         "https://arweave.net/first".to_string(),
         content_hash1,
     );
@@ -4204,6 +4583,7 @@ fn test_mint_win_nft_rejects_double_mint() {
         winner.pubkey(),
         win_record,
         asset2.pubkey(),
+        collection,
         "https://arweave.net/second".to_string(),
         [0u8; 32],
     );
@@ -4220,7 +4600,7 @@ fn test_mint_win_nft_rejects_double_mint() {
 #[test]
 fn test_mint_win_nft_winner_can_mint_after_being_outbid_and_flipped_past() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner_a, win_record_a) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner_a, win_record_a, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     // A second flip happens BEFORE winner_a ever mints -- someone else
     // outbids and takes the toggle.
@@ -4256,6 +4636,7 @@ fn test_mint_win_nft_winner_can_mint_after_being_outbid_and_flipped_past() {
         winner_a.pubkey(),
         win_record_a,
         asset.pubkey(),
+        collection,
         "https://arweave.net/past-win".to_string(),
         content_hash,
     );
@@ -4273,18 +4654,18 @@ fn test_mint_win_nft_winner_can_mint_after_being_outbid_and_flipped_past() {
 #[test]
 fn test_mint_win_nft_rejects_empty_and_oversized_uri() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     // No Ed25519 attestation needed: `InvalidNftUri` is checked before the
     // metadata-signature check.
     let asset1 = Keypair::new();
-    let ix_empty = ix_mint_win_nft(winner.pubkey(), win_record, asset1.pubkey(), String::new(), [0u8; 32]);
+    let ix_empty = ix_mint_win_nft(winner.pubkey(), win_record, asset1.pubkey(), collection, String::new(), [0u8; 32]);
     let res_empty = send_with_signers(&mut svm, &winner, &[&winner, &asset1], ix_empty);
     assert_err_contains(&res_empty, "InvalidNftUri");
 
     let asset2 = Keypair::new();
     let oversized_uri = "a".repeat(MAX_NFT_URI_LEN + 1);
-    let ix_oversized = ix_mint_win_nft(winner.pubkey(), win_record, asset2.pubkey(), oversized_uri, [0u8; 32]);
+    let ix_oversized = ix_mint_win_nft(winner.pubkey(), win_record, asset2.pubkey(), collection, oversized_uri, [0u8; 32]);
     let res_oversized = send_with_signers(&mut svm, &winner, &[&winner, &asset2], ix_oversized);
     assert_err_contains(&res_oversized, "InvalidNftUri");
 
@@ -4299,14 +4680,14 @@ fn test_mint_win_nft_rejects_empty_and_oversized_uri() {
 #[test]
 fn test_mint_win_nft_rejects_wrong_signer() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let asset = Keypair::new();
     let content_hash = [3u8; 32];
     // Valid signature, valid message -- but signed by a keypair that is NOT
     // `METADATA_SIGNER`.
     let ed25519_ix = ed25519_attestation_ix(&WRONG_SIGNER_SEED, &content_hash);
-    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), "https://arweave.net/x".to_string(), content_hash);
+    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), collection, "https://arweave.net/x".to_string(), content_hash);
     let res = send_multi(&mut svm, &winner, &[&winner, &asset], &[ed25519_ix, mint_ix]);
     assert_err_contains(&res, "InvalidMetadataSignature");
 
@@ -4317,7 +4698,7 @@ fn test_mint_win_nft_rejects_wrong_signer() {
 #[test]
 fn test_mint_win_nft_rejects_wrong_message() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let asset = Keypair::new();
     let signed_hash = [5u8; 32];
@@ -4327,6 +4708,7 @@ fn test_mint_win_nft_rejects_wrong_message() {
         winner.pubkey(),
         win_record,
         asset.pubkey(),
+        collection,
         "https://arweave.net/x".to_string(),
         submitted_hash,
     );
@@ -4340,13 +4722,13 @@ fn test_mint_win_nft_rejects_wrong_message() {
 #[test]
 fn test_mint_win_nft_rejects_missing_ed25519_instruction() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let asset = Keypair::new();
     let content_hash = [9u8; 32];
     // `mint_win_nft` sent as the transaction's only/first instruction --
     // `current_index == 0`, so there is no preceding instruction at all.
-    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), "https://arweave.net/x".to_string(), content_hash);
+    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), collection, "https://arweave.net/x".to_string(), content_hash);
     let res = send_with_signers(&mut svm, &winner, &[&winner, &asset], mint_ix);
     assert_err_contains(&res, "InvalidMetadataSignature");
 
@@ -4357,7 +4739,7 @@ fn test_mint_win_nft_rejects_missing_ed25519_instruction() {
 #[test]
 fn test_mint_win_nft_rejects_non_adjacent_ed25519_instruction() {
     let (mut svm, global_state, vault, payer) = new_svm();
-    let (winner, win_record) = settle_one_flip(&mut svm, global_state, vault, &payer);
+    let (winner, win_record, collection) = settle_one_flip_with_collection(&mut svm, global_state, vault, &payer);
 
     let asset = Keypair::new();
     let content_hash = [13u8; 32];
@@ -4369,12 +4751,125 @@ fn test_mint_win_nft_rejects_non_adjacent_ed25519_instruction() {
     // exercised here, independent of whether the signature itself is valid.
     let ed25519_ix = ed25519_attestation_ix(&METADATA_SIGNER_SEED, &content_hash);
     let filler_ix = ed25519_attestation_ix(&WRONG_SIGNER_SEED, b"filler, unrelated attestation");
-    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), "https://arweave.net/x".to_string(), content_hash);
+    let mint_ix = ix_mint_win_nft(winner.pubkey(), win_record, asset.pubkey(), collection, "https://arweave.net/x".to_string(), content_hash);
     let res = send_multi(&mut svm, &winner, &[&winner, &asset], &[ed25519_ix, filler_ix, mint_ix]);
     assert_err_contains(&res, "InvalidMetadataSignature");
 
     let record = get_win_record(&svm, win_record).unwrap();
     assert!(!record.minted);
+}
+
+// ---------------------------------------------------------------------------
+// init_nft_collection() -- shared Win NFT collection setup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_init_nft_collection_happy_path() {
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let treasury = Keypair::new().pubkey();
+    let admin = new_funded_keypair(&mut svm, 10_000_000_000);
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin.pubkey(), 1_000_000)).unwrap();
+
+    let collection = Keypair::new();
+    let ix = ix_init_nft_collection(
+        admin.pubkey(),
+        global_state,
+        collection.pubkey(),
+        "TOGGLD".to_string(),
+        "https://arweave.net/toggld-collection".to_string(),
+    );
+    let res = send_with_signers(&mut svm, &admin, &[&admin, &collection], ix);
+    assert!(res.is_ok(), "{:?}", res.err());
+
+    let config_account = svm.get_account(&nft_collection_config_pda()).expect("NftCollectionConfig must exist");
+    let config = NftCollectionConfig::try_deserialize(&mut config_account.data.as_slice()).unwrap();
+    assert_eq!(config.collection, collection.pubkey());
+
+    let collection_account = svm.get_account(&collection.pubkey()).expect("collection account must exist after CreateCollectionV1");
+    assert_eq!(collection_account.owner, mpl_core::ID);
+    let parsed_collection =
+        mpl_core::Collection::deserialize(&collection_account.data).expect("collection data must parse with plugins");
+    assert_eq!(
+        parsed_collection.base.update_authority,
+        admin.pubkey(),
+        "update_authority must be the real admin wallet, not the PDA -- required for the admin to sign marketplace ownership-verification flows"
+    );
+    assert_eq!(parsed_collection.base.name, "TOGGLD");
+
+    let update_delegate = parsed_collection
+        .plugin_list
+        .update_delegate
+        .as_ref()
+        .expect("UpdateDelegate plugin must be present");
+    assert_eq!(
+        update_delegate.update_delegate.additional_delegates,
+        vec![collection_authority_pda()],
+        "collection_authority PDA must be delegated exactly the mint-linking capability, nothing more"
+    );
+
+    let royalties = parsed_collection.plugin_list.royalties.as_ref().expect("Royalties plugin must be present");
+    assert_eq!(royalties.royalties.basis_points, NFT_ROYALTY_BASIS_POINTS);
+    assert_eq!(royalties.royalties.creators.len(), 1);
+    assert_eq!(royalties.royalties.creators[0].address, treasury);
+    assert_eq!(royalties.royalties.creators[0].percentage, 100);
+
+    let verified_creators = parsed_collection
+        .plugin_list
+        .verified_creators
+        .as_ref()
+        .expect("VerifiedCreators plugin must be present");
+    assert_eq!(verified_creators.verified_creators.signatures.len(), 1);
+    assert_eq!(verified_creators.verified_creators.signatures[0].address, admin.pubkey());
+    assert!(
+        !verified_creators.verified_creators.signatures[0].verified,
+        "mpl-core rejects verified:true at CreateCollectionV1 time even for a genuine signer -- must start unverified"
+    );
+}
+
+#[test]
+fn test_init_nft_collection_rejects_non_admin_caller() {
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let treasury = Keypair::new().pubkey();
+    let admin = new_funded_keypair(&mut svm, 10_000_000_000);
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin.pubkey(), 1_000_000)).unwrap();
+
+    let impostor = new_funded_keypair(&mut svm, 10_000_000_000);
+    let collection = Keypair::new();
+    let ix = ix_init_nft_collection(
+        impostor.pubkey(),
+        global_state,
+        collection.pubkey(),
+        "TOGGLD".to_string(),
+        "https://arweave.net/toggld-collection".to_string(),
+    );
+    let res = send_with_signers(&mut svm, &impostor, &[&impostor, &collection], ix);
+    assert_err_contains(&res, "Unauthorized");
+    assert!(svm.get_account(&nft_collection_config_pda()).is_none(), "a rejected call must never create the config PDA");
+}
+
+#[test]
+fn test_init_nft_collection_rejects_second_call() {
+    let (mut svm, global_state, vault, payer) = new_svm();
+    let treasury = Keypair::new().pubkey();
+    let admin = new_funded_keypair(&mut svm, 10_000_000_000);
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin.pubkey(), 1_000_000)).unwrap();
+
+    let first_collection = init_nft_collection_for_test(&mut svm, &admin, global_state);
+
+    let second_collection = Keypair::new();
+    let ix = ix_init_nft_collection(
+        admin.pubkey(),
+        global_state,
+        second_collection.pubkey(),
+        "TOGGLD".to_string(),
+        "https://arweave.net/toggld-collection-2".to_string(),
+    );
+    let res = send_with_signers(&mut svm, &admin, &[&admin, &second_collection], ix);
+    assert!(res.is_err(), "a second init_nft_collection call must fail -- the config PDA already exists");
+
+    let config_account = svm.get_account(&nft_collection_config_pda()).unwrap();
+    let config = NftCollectionConfig::try_deserialize(&mut config_account.data.as_slice()).unwrap();
+    assert_eq!(config.collection, first_collection, "the original collection must remain the configured one");
 }
 
 // ---------------------------------------------------------------------------
@@ -4392,9 +4887,10 @@ fn test_atomic_settle_ed25519_mint_win_nft_happy_path() {
     let (mut svm, global_state, vault, payer) = new_svm();
 
     let treasury = Keypair::new().pubkey();
-    let admin = Keypair::new().pubkey();
+    let admin = new_funded_keypair(&mut svm, 10_000_000_000);
     set_clock_ts(&mut svm, 1_000);
-    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin, 1_000_000)).unwrap();
+    send(&mut svm, &payer, ix_initialize(global_state, vault, payer.pubkey(), treasury, admin.pubkey(), 1_000_000)).unwrap();
+    let collection = init_nft_collection_for_test(&mut svm, &admin, global_state);
 
     let winner = new_funded_keypair(&mut svm, 10_000_000_000);
     let gs0 = get_global_state(&svm, global_state);
@@ -4413,6 +4909,7 @@ fn test_atomic_settle_ed25519_mint_win_nft_happy_path() {
         winner.pubkey(),
         win_record,
         asset.pubkey(),
+        collection,
         "https://arweave.net/atomic".to_string(),
         content_hash,
     );

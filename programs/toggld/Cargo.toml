@@ -23,8 +23,17 @@ custom-panic = []
 # devnet-mirrors-mainnet one. Never combine with a mainnet deploy —
 # `anchor build --  --features devnet-scratch` (or `cargo build-sbf --
 # --features devnet-scratch`) only, and only when deploying to
-# `SVXHvuGg1FxHFGw2hTHwMpz4dCCUVqoDv53wJN2uybS`.
+# `3VD3z82gxHoHneFdT3oVpYTfbzqfhYjhqREzTp1FyWhy`.
 devnet-scratch = []
+# Swaps `constants::METADATA_SIGNER` to the LiteSVM fixture key whose seed is
+# `tests/toggld.rs`'s `METADATA_SIGNER_SEED` (see that constant's doc
+# comment). Test builds ONLY: `cargo build-sbf --manifest-path
+# programs/toggld/Cargo.toml --features test-fixtures --sbf-out-dir
+# target/deploy-test-fixtures` (a separate out dir, so it never overwrites
+# the deployable target/deploy/toggld.so). The root workspace's
+# dev-dependency enables it for the host side of `cargo test`.
+# scripts/deploy-mainnet.sh refuses any .so that embeds the fixture key.
+test-fixtures = []
 
 
 [dependencies]

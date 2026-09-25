@@ -22,9 +22,9 @@ pub use state::*;
 // devnet-mirrors-mainnet address above. Never build mainnet with this
 // feature enabled — see Cargo.toml's `devnet-scratch` feature doc comment.
 #[cfg(not(feature = "devnet-scratch"))]
-declare_id!("GYmvJkBxk8Ym2pJjbZi3PqicHPD2jkBG4jgCGsSuoaDD");
+declare_id!("TGLDktEJpotXY4AD7DN87huoX7raCxHhnBqetELb5MC");
 #[cfg(feature = "devnet-scratch")]
-declare_id!("SVXHvuGg1FxHFGw2hTHwMpz4dCCUVqoDv53wJN2uybS");
+declare_id!("3VD3z82gxHoHneFdT3oVpYTfbzqfhYjhqREzTp1FyWhy");
 
 // Gated `not(no-entrypoint)`, per `solana-security-txt`'s own README: the
 // macro must never compile into a CPI/library build (a program that depends
@@ -146,5 +146,11 @@ pub mod toggld {
     /// Mints a snapshot-once, immutable Metaplex Core asset for that win.
     pub fn mint_win_nft(ctx: Context<MintWinNft>, uri: String, content_hash: [u8; 32]) -> Result<()> {
         mint_win_nft::handler(ctx, uri, content_hash)
+    }
+
+    /// One-time, admin-gated. Creates the shared mpl-core Collection every
+    /// future `mint_win_nft()` call links its new asset into.
+    pub fn init_nft_collection(ctx: Context<InitNftCollection>, name: String, uri: String) -> Result<()> {
+        init_nft_collection::handler(ctx, name, uri)
     }
 }

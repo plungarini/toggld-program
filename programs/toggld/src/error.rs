@@ -108,4 +108,17 @@ pub enum ErrorCode {
 
     #[msg("Missing or invalid Ed25519 metadata-signer attestation for this content hash")]
     InvalidMetadataSignature,
+
+    #[msg("name must be non-empty and no longer than the configured maximum")]
+    InvalidCollectionName,
+
+    #[msg("The Win NFT collection has not been configured yet")]
+    NftCollectionNotConfigured,
+
+    #[msg("collection account does not match the configured Win NFT collection")]
+    InvalidNftCollection,
+
+    // Appended last: Anchor codes are positional, so new variants go at the end.
+    #[msg("rent_payer account does not match the account's recorded rent payer")]
+    InvalidRentPayer,
 }

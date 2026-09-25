@@ -10,10 +10,10 @@ use crate::state::{GlobalState, WinRecord};
 /// holder(32) + holder_since(8) + current_price(8) + is_on(1) + total_challenges(8)
 /// + holder_count(8)
 /// + treasury(32) + burn_address(32) + fee_bps(2) + admin(32) + params_locked(1)
-/// + min_raise_bps(2) + base_window_secs(4) + snipe_extend_secs(4) + genesis_price(8)
+/// + min_raise_bps(2) + base_window_secs(4) + genesis_price(8)
 /// + window_active(1) + window_end_ts(8) + top_bidder(32) + top_bid_amount(8)
-/// + escrowed_amount(8) + treasury_balance(8) + vault_bump(1) = 248
-pub(crate) const GLOBAL_STATE_SPACE: usize = 8 + 248;
+/// + escrowed_amount(8) + treasury_balance(8) + vault_bump(1) = 244
+pub(crate) const GLOBAL_STATE_SPACE: usize = 8 + 244;
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -126,7 +126,6 @@ pub(crate) fn handler(
 
     global_state.min_raise_bps = DEFAULT_MIN_RAISE_BPS;
     global_state.base_window_secs = DEFAULT_BASE_WINDOW_SECS;
-    global_state.snipe_extend_secs = DEFAULT_SNIPE_EXTEND_SECS;
     global_state.genesis_price = genesis_price;
 
     global_state.window_active = false;

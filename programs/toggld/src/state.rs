@@ -26,7 +26,6 @@ pub struct GlobalState {
     // beta-tunable (blocked once params_locked)
     pub min_raise_bps: u16,
     pub base_window_secs: u32,
-    pub snipe_extend_secs: u32,
     pub genesis_price: u64,
 
     // active-window state
@@ -69,10 +68,24 @@ pub struct PendingRefund {
     /// refunds sitting in these side accounts.
     pub amount: u64,
     pub bump: u8,
+    /// Whoever's `challenge()` call paid this account's rent-exempt reserve
+    /// on first creation (`init_if_needed`'s `payer = challenger` --
+    /// `bidder`'s own outbidder, a different person than `bidder`). Set once,
+    /// on creation, and never touched again by the accumulate-only path.
+    ///
+    /// `claim_refund()` must return this reserve to `rent_payer`, never to
+    /// `bidder` -- `bidder` already gets exactly `amount` (their own money,
+    /// nothing more). Before this field existed, the reserve went to
+    /// `bidder` along with `amount`, silently moving `rent_payer`'s money to
+    /// an unrelated third party on every claim -- a direct user-to-user
+    /// transfer, which this program's invariants (see root `CLAUDE.md`)
+    /// forbid. Every claim now pays out to exactly the two people who put
+    /// money in: `bidder` gets `amount`, `rent_payer` gets the reserve.
+    pub rent_payer: Pubkey,
 }
 
 impl PendingRefund {
-    pub const SPACE: usize = 8 + 32 + 8 + 1;
+    pub const SPACE: usize = 8 + 32 + 8 + 1 + 32;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +139,27 @@ impl WinRecord {
     /// 8 (discriminator) + 32 winner + 8 holder_count + 8 price_paid
     /// + 8 won_at + 1 minted + 1 bump = 8 + 58.
     pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 1 + 1;
+}
+
+/// One-time PDA (`seeds = [NFT_COLLECTION_CONFIG_SEED]`) written by
+/// `init_nft_collection()`. Records the mpl-core Collection account every
+/// `mint_win_nft()` call links its new asset into, so that account is
+/// constrained (`address = nft_collection_config.collection`) rather than
+/// trusted from caller input.
+#[account]
+pub struct NftCollectionConfig {
+    /// The mpl-core Collection account address.
+    pub collection: Pubkey,
+    /// Bump for the `collection_authority` PDA (`seeds =
+    /// [COLLECTION_AUTHORITY_SEED]`) -- the Collection's on-chain
+    /// `update_authority`, used to `invoke_signed` the per-mint linkage CPI.
+    pub collection_authority_bump: u8,
+    pub bump: u8,
+}
+
+impl NftCollectionConfig {
+    /// 8 (discriminator) + 32 collection + 1 collection_authority_bump + 1 bump.
+    pub const SPACE: usize = 8 + 32 + 1 + 1;
 }
 
 // ---------------------------------------------------------------------------
